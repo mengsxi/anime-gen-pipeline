@@ -1,0 +1,55 @@
+# ============================================================
+# Anime Gen Pipeline — 默认配置
+# ============================================================
+
+# --- 模型路径 ---
+models:
+  base_model_id: "andite/anything-v5.0"        # 动漫基础模型 (SD1.5生态)
+  base_model_path: "./models/base"             # 本地缓存路径
+  vae_model_id: null                            # null=用内置VAE, 可设为 "stabilityai/sd-vae-ft-mse"
+  
+  controlnet:
+    # 各 ControlNet 模型 (按需下载, 不用的设为 null)
+    pose:    "lllyasviel/control_v11p_sd15_openpose"
+    lineart: "lllyasviel/control_v11p_sd15_lineart"
+    scribble: "lllyasviel/control_v11p_sd15_scribble"
+    canny:   "lllyasviel/control_v11p_sd15_canny"
+    depth:   "lllyasviel/control_v11p_sd15_depth"
+    softedge: "lllyasviel/control_v11p_sd15_softedge"
+
+  lora_dir: "./models/lora"                    # LoRA 模型目录
+
+# --- 推理参数 ---
+inference:
+  device: "cuda"          # cuda / cpu / mps
+  torch_dtype: "fp16"     # fp16 / fp32 / bf16
+  default_steps: 20
+  default_cfg: 7.0
+  default_width: 512
+  default_height: 768     # 动漫常用竖构图
+  default_batch_size: 1
+  default_seed: -1        # -1 = 随机
+
+# --- 低配优化 (Low VRAM) ---
+low_vram:
+  enable_attention_slicing: true     # 切片注意力, 降低 ~30% VRAM
+  enable_vae_slicing: true           # VAE 分块解码
+  enable_vae_tiling: true            # VAE 分块编码/解码 (大图必须)
+  enable_model_cpu_offload: false    # 逐模块 CPU offload (极低VRAM, 但慢)
+  enable_sequential_cpu_offload: false  # 顺序 offload
+  enable_xformers: true              # xformers 高效注意力 (仅 CUDA)
+  enable_tome: false                 # Token Merging (加速, 质量略微下降)
+  tome_ratio: 0.5                    # ToMe 合并比例
+
+# --- 输出 ---
+output:
+  dir: "./outputs"
+  format: "png"
+  save_metadata: true               # PNG info 嵌入生成参数
+
+# --- WebUI ---
+webui:
+  host: "127.0.0.1"
+  port: 7860
+  share: false
+  theme: "soft"

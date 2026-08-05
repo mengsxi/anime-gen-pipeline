@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# Model weights (too large for git)
+models/
+*.ckpt
+*.safetensors
+*.bin
+*.pth
+*.onnx
+
+# Outputs
+outputs/
+*.png
+*.jpg
+*.webp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Gradio
+gradio_cached_examples/
+*.log
+
+# Cache
+.cache/
+huggingface/

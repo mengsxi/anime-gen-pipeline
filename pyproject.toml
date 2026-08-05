@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anime-gen-pipeline"
+version = "0.1.0"
+description = "2D Anime Controllable Image Generation Pipeline — optimized for low-spec PCs"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Your Name", email = "your@email.com" }
+]
+keywords = [
+    "anime", "stable-diffusion", "controlnet", "image-generation",
+    "ai-art", "pipeline", "low-vram", "gradio"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Graphics",
+]
+
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "diffusers>=0.27.0",
+    "transformers>=4.36.0",
+    "accelerate>=0.25.0",
+    "safetensors>=0.4.0",
+    "xformers>=0.0.23; platform_system != 'Darwin'",
+    "gradio>=4.0.0",
+    "opencv-python-headless>=4.8.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "omegaconf>=2.3.0",
+    "pyyaml>=6.0",
+    "huggingface_hub>=0.20.0",
+    "controlnet_aux>=0.0.7",
+    "compel>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+    "pre-commit>=3.0",
+]
+
+[project.scripts]
+anime-gen = "anime_gen.cli:main"
+anime-gen-webui = "anime_gen.webui:main"
+anime-gen-download = "anime_gen.download:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/anime-gen-pipeline"
+Repository = "https://github.com/yourusername/anime-gen-pipeline.git"
+Issues = "https://github.com/yourusername/anime-gen-pipeline/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
