@@ -12,9 +12,8 @@ ControlNet 预处理与集成模块
 
 import logging
 from enum import Enum
-from typing import Optional, Union
+from typing import Union
 
-import cv2
 import numpy as np
 from PIL import Image
 
@@ -143,13 +142,15 @@ class ControlNetProcessor:
         self, img: Image.Image, low: int = 100, high: int = 200
     ) -> Image.Image:
         """Canny 边缘检测"""
+        import cv2
+
         arr = np.array(img)
         if len(arr.shape) == 3:
             gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
         else:
             gray = arr
         edges = cv2.Canny(gray, low, high)
-        return Image.fromarray(edges)
+        return Image.fromarray(np.repeat(edges[:, :, None], 3, axis=2), mode="RGB")
 
     def _preprocess_depth(self, img: Image.Image) -> Image.Image:
         """深度图估计"""

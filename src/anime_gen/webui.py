@@ -8,18 +8,19 @@ Gradio Web UI — 提供可视化的动漫图像生成交互界面
 """
 
 import logging
-from pathlib import Path
 
-from .config import load_config
+from .config import AppConfig, load_config
 from .controlnet import ControlMode
 from .pipeline import AnimePipeline, GenParams
 
 logger = logging.getLogger(__name__)
 
 
-def create_ui():
+def create_ui(config: AppConfig | None = None):
     """构建 Gradio 界面"""
     import gradio as gr
+
+    config = config or load_config()
 
     # --- 自定义 CSS ---
     css = """
@@ -47,7 +48,7 @@ def create_ui():
 
     def get_pipeline():
         if pipe_holder["pipeline"] is None:
-            pipe_holder["pipeline"] = AnimePipeline()
+            pipe_holder["pipeline"] = AnimePipeline(config)
         return pipe_holder["pipeline"]
 
     # ================================================================
@@ -140,7 +141,11 @@ def create_ui():
     # 界面布局
     # ================================================================
 
-    with gr.Blocks(css=css, title="Anime Gen Pipeline", theme="soft") as demo:
+    with gr.Blocks(
+        css=css,
+        title="Anime Gen Pipeline",
+        theme=config.webui.theme,
+    ) as demo:
         gr.HTML('<div class="anime-title">Anime Gen Pipeline</div>')
         gr.HTML('<div class="anime-subtitle">2D 动漫可控图像生成 · 低配 PC 优化版</div>')
 
@@ -169,8 +174,18 @@ def create_ui():
                             lines=2,
                         )
                         with gr.Row():
-                            txt2img_seed = gr.Number(label="Seed (-1=随机)", value=-1, precision=0)
-                            txt2img_batch = gr.Slider(1, 4, value=1, step=1, label="Batch Size")
+                            txt2img_seed = gr.Number(
+                                label="Seed (-1=随机)",
+                                value=config.inference.default_seed,
+                                precision=0,
+                            )
+                            txt2img_batch = gr.Slider(
+                                1,
+                                4,
+                                value=config.inference.default_batch_size,
+                                step=1,
+                                label="Batch Size",
+                            )
                         with gr.Row():
                             txt2img_btn = gr.Button("生成", variant="primary", scale=3)
                             txt2img_seed_out = gr.Number(label="实际 Seed", interactive=False)
@@ -180,11 +195,35 @@ def create_ui():
 
                 with gr.Accordion("高级设置", open=False):
                     with gr.Row():
-                        txt2img_w = gr.Slider(256, 1024, value=512, step=64, label="宽度")
-                        txt2img_h = gr.Slider(256, 1024, value=768, step=64, label="高度")
+                        txt2img_w = gr.Slider(
+                            256,
+                            1024,
+                            value=config.inference.default_width,
+                            step=64,
+                            label="宽度",
+                        )
+                        txt2img_h = gr.Slider(
+                            256,
+                            1024,
+                            value=config.inference.default_height,
+                            step=64,
+                            label="高度",
+                        )
                     with gr.Row():
-                        txt2img_steps = gr.Slider(10, 50, value=20, step=1, label="步数")
-                        txt2img_cfg = gr.Slider(1.0, 15.0, value=7.0, step=0.5, label="CFG Scale")
+                        txt2img_steps = gr.Slider(
+                            1,
+                            50,
+                            value=config.inference.default_steps,
+                            step=1,
+                            label="步数",
+                        )
+                        txt2img_cfg = gr.Slider(
+                            0.0,
+                            15.0,
+                            value=config.inference.default_cfg,
+                            step=0.5,
+                            label="CFG Scale",
+                        )
 
                 txt2img_btn.click(
                     fn=on_generate_txt2img,
@@ -206,7 +245,11 @@ def create_ui():
                             img2img_strength = gr.Slider(
                                 0.1, 1.0, value=0.75, step=0.05, label="重绘强度"
                             )
-                            img2img_seed = gr.Number(label="Seed", value=-1, precision=0)
+                            img2img_seed = gr.Number(
+                                label="Seed",
+                                value=config.inference.default_seed,
+                                precision=0,
+                            )
                         with gr.Row():
                             img2img_btn = gr.Button("生成", variant="primary")
                             img2img_seed_out = gr.Number(label="实际 Seed", interactive=False)
@@ -239,7 +282,11 @@ def create_ui():
                             0.1, 1.5, value=0.8, step=0.05, label="ControlNet 权重"
                         )
                         with gr.Row():
-                            cn_seed = gr.Number(label="Seed", value=-1, precision=0)
+                            cn_seed = gr.Number(
+                                label="Seed",
+                                value=config.inference.default_seed,
+                                precision=0,
+                            )
                             cn_btn = gr.Button("生成", variant="primary")
                             cn_seed_out = gr.Number(label="实际 Seed", interactive=False)
 
@@ -298,7 +345,7 @@ def main():
     config = load_config()
     wc = config.webui
 
-    demo = create_ui()
+    demo = create_ui(config)
     demo.queue(max_size=10)
     demo.launch(
         server_name=wc.host,

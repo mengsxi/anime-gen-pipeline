@@ -1,17 +1,13 @@
-"""
-核心生成 Pipeline — 统一入口, 支持 txt2img / img2img / inpaint + ControlNet
-"""
+"""统一的动漫图像生成入口。"""
 
 from __future__ import annotations
 
-import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Optional
 
-import numpy as np
 import torch
 from PIL import Image, PngImagePlugin
 
@@ -22,99 +18,73 @@ from .engine import ModelEngine
 logger = logging.getLogger(__name__)
 
 
-# ================================================================
-# 数据类型
-# ================================================================
+DEFAULT_NEGATIVE_PROMPT = (
+    "lowres, bad anatomy, bad hands, text, error, missing fingers, "
+    "extra digit, fewer digits, cropped, worst quality, low quality, "
+    "normal quality, jpeg artifacts, signature, watermark, username, "
+    "blurry, ugly, deformed"
+)
+
 
 @dataclass
 class GenParams:
-    """单次生成参数"""
+    """单次生成参数；为 ``None`` 的通用参数会从 AppConfig 读取。"""
+
     prompt: str = ""
-    negative_prompt: str = (
-        "lowres, bad anatomy, bad hands, text, error, missing fingers, "
-        "extra digit, fewer digits, cropped, worst quality, low quality, "
-        "normal quality, jpeg artifacts, signature, watermark, username, "
-        "blurry, ugly, deformed"
-    )
+    negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
 
-    # 尺寸
-    width: int = 512
-    height: int = 768
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    cfg_scale: Optional[float] = None
+    seed: Optional[int] = None
+    batch_size: Optional[int] = None
 
-    # 推理
-    steps: int = 20
-    cfg_scale: float = 7.0
-    seed: int = -1
-    batch_size: int = 1
-
-    # img2img
     init_image: Optional[Image.Image] = None
     strength: float = 0.75
 
-    # ControlNet
     control_image: Optional[Image.Image] = None
     control_mode: Optional[ControlMode] = None
     control_weight: float = 0.8
 
-    # Inpaint
     mask_image: Optional[Image.Image] = None
 
-    # LoRA
     lora_path: Optional[str] = None
     lora_scale: float = 0.75
 
-    # 输出
-    output_dir: str = "./outputs"
+    output_dir: Optional[str] = None
     filename_prefix: str = "anime"
-    save_metadata: bool = True
+    save_metadata: Optional[bool] = None
 
 
 @dataclass
 class GenResult:
-    """生成结果"""
+    """生成结果。"""
+
     images: list[Image.Image]
     params: GenParams
-    elapsed: float           # 秒
+    elapsed: float
     seed_used: int
     metadata: dict = field(default_factory=dict)
 
 
-# ================================================================
-# Pipeline
-# ================================================================
-
 class AnimePipeline:
-    """
-    动漫图像生成 Pipeline 主类
-
-    使用示例:
-        pipe = AnimePipeline()
-        result = pipe.txt2img(GenParams(prompt="1girl, sunset, masterpiece"))
-        result.images[0].save("output.png")
-    """
+    """支持 txt2img、img2img、inpaint 和单 ControlNet 的生成入口。"""
 
     def __init__(self, config: Optional[AppConfig] = None):
         self.config = config or get_config()
         self.engine = ModelEngine(self.config)
         self.cn_processor: Optional[ControlNetProcessor] = None
-        logger.info("AnimePipeline 初始化完成")
-
-    # ----------------------------------------------------------------
-    # 生成模式
-    # ----------------------------------------------------------------
 
     def txt2img(self, params: GenParams) -> GenResult:
-        """文生图"""
         return self._generate(params, mode="txt2img")
 
     def img2img(self, params: GenParams) -> GenResult:
-        """图生图 (需设置 init_image + strength)"""
         if params.init_image is None:
             raise ValueError("img2img 需要提供 init_image")
         return self._generate(params, mode="img2img")
 
     def inpaint(self, params: GenParams) -> GenResult:
-        """局部重绘 (需设置 init_image + mask_image)"""
         if params.init_image is None or params.mask_image is None:
             raise ValueError("inpaint 需要提供 init_image 和 mask_image")
         return self._generate(params, mode="inpaint")
@@ -125,78 +95,76 @@ class AnimePipeline:
         control_image: Image.Image,
         control_mode: ControlMode | str = ControlMode.LINEART,
     ) -> GenResult:
-        """
-        使用 ControlNet 条件生成
-
-        Args:
-            params:         生成参数
-            control_image:  条件输入图 (如照片、草图)
-            control_mode:   控制模式
-
-        工作流程:
-            输入图 → 预处理器提取条件图 → ControlNet → SD 生成
-        """
         if isinstance(control_mode, str):
             control_mode = ControlMode(control_mode)
 
-        # 预处理: 将输入图转为条件图
-        processor = self._get_cn_processor()
-        condition = processor.process(control_image, control_mode)
-
-        params.control_image = condition
-        params.control_mode = control_mode
-
-        return self._generate(params, mode="txt2img")
-
-    # ----------------------------------------------------------------
-    # 核心生成逻辑
-    # ----------------------------------------------------------------
+        condition = self._get_cn_processor().process(control_image, control_mode)
+        resolved = replace(
+            params,
+            control_image=condition,
+            control_mode=control_mode,
+        )
+        return self._generate(resolved, mode="txt2img")
 
     def _generate(self, params: GenParams, mode: str) -> GenResult:
-        t0 = time.time()
+        t0 = time.perf_counter()
+        params = self._resolve_params(params)
+        self._validate_params(params, mode)
 
-        # 1. 种子
-        seed = params.seed if params.seed >= 0 else torch.randint(0, 2**31 - 1, (1,)).item()
-        generator = torch.Generator(device=self.engine.get_device()).manual_seed(seed)
+        seed = (
+            params.seed
+            if params.seed is not None and params.seed >= 0
+            else torch.randint(0, 2**31 - 1, (1,)).item()
+        )
+        generator = torch.Generator(
+            device=self.engine.get_generator_device()
+        ).manual_seed(seed)
 
-        # 2. LoRA (按需加载/卸载)
+        control_mode = params.control_mode.value if params.control_mode else None
+        pipe = self.engine.get_pipeline(mode=mode, control_mode=control_mode)
+
         lora_loaded = False
-        if params.lora_path and Path(params.lora_path).exists():
-            self.engine.pipe.load_lora_weights(params.lora_path)
+        lora_scale_via_kwargs = False
+        if params.lora_path:
+            lora_path = Path(params.lora_path)
+            if not lora_path.is_file():
+                raise FileNotFoundError(f"LoRA 文件不存在: {lora_path}")
+            pipe.load_lora_weights(
+                str(lora_path.parent),
+                weight_name=lora_path.name,
+                adapter_name="request",
+            )
+            if hasattr(pipe, "set_adapters"):
+                pipe.set_adapters("request", adapter_weights=params.lora_scale)
+            else:
+                lora_scale_via_kwargs = True
             lora_loaded = True
 
-        # 3. ControlNet 配置
-        controlnet_condition = None
-        if params.control_image is not None and params.control_mode is not None:
-            cn_model = self.engine.load_controlnet(params.control_mode.value)
-            controlnet_condition = self._prepare_controlnet(
-                params.control_image, params.control_weight
-            )
-
-        # 4. 调度器参数
-        self._set_scheduler_params(params.steps)
-
-        # 5. 生成
         try:
-            images = self._run_inference(params, mode, generator, controlnet_condition)
+            images = self._run_inference(
+                pipe,
+                params,
+                mode,
+                generator,
+                lora_scale_via_kwargs=lora_scale_via_kwargs,
+            )
         finally:
-            # 卸载 LoRA (避免影响后续生成)
             if lora_loaded:
                 try:
-                    self.engine.pipe.unload_lora_weights()
+                    pipe.unload_lora_weights()
                 except Exception:
-                    pass
+                    logger.exception("LoRA 卸载失败，将释放 Pipeline 防止状态污染")
+                    self.engine.unload_all()
 
-        # 6. 保存
         saved_paths = self._save_images(images, params, seed)
-
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter() - t0
         logger.info(
-            f"生成完成 — {len(images)} 张, "
-            f"{elapsed:.1f}s, seed={seed}, "
-            f"{self.engine.get_vram_info()}"
+            "生成完成 — %s 张, %.1fs, seed=%s, %s",
+            len(images),
+            elapsed,
+            seed,
+            self.engine.get_vram_info(),
         )
-
         return GenResult(
             images=images,
             params=params,
@@ -205,40 +173,43 @@ class AnimePipeline:
             metadata={"saved_paths": saved_paths},
         )
 
+    @staticmethod
     def _run_inference(
-        self,
+        pipe,
         params: GenParams,
         mode: str,
         generator: torch.Generator,
-        controlnet_condition: Optional[tuple],
+        *,
+        lora_scale_via_kwargs: bool,
     ) -> list[Image.Image]:
-        """执行实际推理"""
-        pipe = self.engine.pipe
-        common = dict(
-            prompt=params.prompt,
-            negative_prompt=params.negative_prompt,
-            num_inference_steps=params.steps,
-            guidance_scale=params.cfg_scale,
-            generator=generator,
-            num_images_per_prompt=params.batch_size,
-            width=params.width,
-            height=params.height,
-        )
+        common = {
+            "prompt": params.prompt,
+            "negative_prompt": params.negative_prompt,
+            "num_inference_steps": params.steps,
+            "guidance_scale": params.cfg_scale,
+            "generator": generator,
+            "num_images_per_prompt": params.batch_size,
+            "width": params.width,
+            "height": params.height,
+        }
+        # 较早版本没有 set_adapters 时，退回 cross_attention_kwargs。
+        if lora_scale_via_kwargs:
+            common["cross_attention_kwargs"] = {"scale": params.lora_scale}
 
-        if mode == "txt2img":
-            if controlnet_condition:
-                cn_image, cn_scale = controlnet_condition
-                result = pipe(image=cn_image, **common)
-            else:
-                result = pipe(**common)
-
+        if params.control_image is not None and params.control_mode is not None:
+            result = pipe(
+                image=params.control_image,
+                controlnet_conditioning_scale=params.control_weight,
+                **common,
+            )
+        elif mode == "txt2img":
+            result = pipe(**common)
         elif mode == "img2img":
             result = pipe(
                 image=params.init_image,
                 strength=params.strength,
                 **common,
             )
-
         elif mode == "inpaint":
             result = pipe(
                 image=params.init_image,
@@ -248,29 +219,68 @@ class AnimePipeline:
             )
         else:
             raise ValueError(f"未知模式: {mode}")
-
         return result.images
 
-    def _prepare_controlnet(
-        self, control_image: Image.Image, weight: float
-    ) -> tuple:
-        """准备 ControlNet 条件输入"""
-        # 如果 pipe 还没有设置 controlnet, 需要设置
-        cn = self.engine._controlnet_models.get(
-            list(self.engine._controlnet_models.keys())[0]
-            if self.engine._controlnet_models else None
+    def _resolve_params(self, params: GenParams) -> GenParams:
+        inference = self.config.inference
+        output = self.config.output
+        return replace(
+            params,
+            width=params.width if params.width is not None else inference.default_width,
+            height=params.height if params.height is not None else inference.default_height,
+            steps=params.steps if params.steps is not None else inference.default_steps,
+            cfg_scale=(
+                params.cfg_scale
+                if params.cfg_scale is not None
+                else inference.default_cfg
+            ),
+            seed=params.seed if params.seed is not None else inference.default_seed,
+            batch_size=(
+                params.batch_size
+                if params.batch_size is not None
+                else inference.default_batch_size
+            ),
+            output_dir=params.output_dir if params.output_dir is not None else output.dir,
+            save_metadata=(
+                params.save_metadata
+                if params.save_metadata is not None
+                else output.save_metadata
+            ),
         )
-        return control_image, weight
 
-    def _set_scheduler_params(self, steps: int):
-        """设置调度器总步数"""
-        pipe = self.engine.pipe
-        if hasattr(pipe.scheduler, "set_timesteps"):
-            pipe.scheduler.set_timesteps(steps, device=self.engine.get_device())
+    def _validate_params(self, params: GenParams, mode: str):
+        if mode not in {"txt2img", "img2img", "inpaint"}:
+            raise ValueError(f"未知模式: {mode}")
+        if not isinstance(params.prompt, str) or not params.prompt.strip():
+            raise ValueError("prompt 不能为空")
+        if params.width is None or params.height is None:
+            raise ValueError("width 和 height 必须已解析")
+        if params.width <= 0 or params.height <= 0:
+            raise ValueError("width 和 height 必须大于 0")
+        if params.width % 8 or params.height % 8:
+            raise ValueError("width 和 height 必须是 8 的倍数")
+        if params.steps is None or params.steps <= 0:
+            raise ValueError("steps 必须大于 0")
+        if params.batch_size is None or params.batch_size <= 0:
+            raise ValueError("batch_size 必须大于 0")
+        if params.cfg_scale is None or params.cfg_scale < 0:
+            raise ValueError("cfg_scale 不能为负数")
+        if not 0 <= params.strength <= 1:
+            raise ValueError("strength 必须在 0 到 1 之间")
+        if params.control_weight < 0:
+            raise ValueError("control_weight 不能为负数")
+        if params.lora_scale < 0:
+            raise ValueError("lora_scale 不能为负数")
+        if params.seed is not None and params.seed < -1:
+            raise ValueError("seed 必须为 -1 或非负整数")
+        if not params.filename_prefix or params.filename_prefix in {".", ".."}:
+            raise ValueError("filename_prefix 不能为空或路径标记")
+        if "/" in params.filename_prefix or "\\" in params.filename_prefix:
+            raise ValueError("filename_prefix 不能包含路径分隔符")
 
-    # ----------------------------------------------------------------
-    # 保存
-    # ----------------------------------------------------------------
+        fmt = self.config.output.format.lower().lstrip(".")
+        if fmt not in {"png", "jpg", "jpeg", "webp"}:
+            raise ValueError(f"不支持的输出格式: {fmt}")
 
     def _save_images(
         self,
@@ -278,32 +288,36 @@ class AnimePipeline:
         params: GenParams,
         seed: int,
     ) -> list[str]:
-        """保存图片到磁盘"""
+        if params.output_dir is None:
+            raise ValueError("output_dir 必须已解析")
         output_dir = Path(params.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        fmt = self.config.output.format.lower().lstrip(".")
 
         saved = []
-        fmt = self.config.output.format
-
-        for i, img in enumerate(images):
-            filename = f"{params.filename_prefix}_{seed}_{i:02d}.{fmt}"
-            filepath = output_dir / filename
-
-            if params.save_metadata and fmt.lower() == "png":
-                # 嵌入生成参数到 PNG 元数据
-                meta = PngImagePlugin.PngInfo()
-                meta.add_text("parameters", self._build_metadata_string(params, seed))
-                img.save(filepath, pnginfo=meta)
+        for index, image in enumerate(images):
+            stem = f"{params.filename_prefix}_{seed}_{index:02d}"
+            filepath = self._next_available_path(output_dir, stem, fmt)
+            if params.save_metadata and fmt == "png":
+                metadata = PngImagePlugin.PngInfo()
+                metadata.add_text("parameters", self._build_metadata_string(params, seed))
+                image.save(filepath, pnginfo=metadata)
             else:
-                img.save(filepath)
-
+                image.save(filepath)
             saved.append(str(filepath))
-
         return saved
 
     @staticmethod
+    def _next_available_path(output_dir: Path, stem: str, suffix: str) -> Path:
+        candidate = output_dir / f"{stem}.{suffix}"
+        counter = 1
+        while candidate.exists():
+            candidate = output_dir / f"{stem}_{counter:02d}.{suffix}"
+            counter += 1
+        return candidate
+
+    @staticmethod
     def _build_metadata_string(params: GenParams, seed: int) -> str:
-        """构造类似 A1111 的 metadata 字符串"""
         lines = [
             params.prompt,
             f"Negative prompt: {params.negative_prompt}",
@@ -311,12 +325,13 @@ class AnimePipeline:
             f"Seed: {seed}, Size: {params.width}x{params.height}",
         ]
         if params.control_mode:
-            lines.append(f"ControlNet: {params.control_mode.value}")
+            lines.append(
+                f"ControlNet: {params.control_mode.value}, "
+                f"weight: {params.control_weight}"
+            )
+        if params.lora_path:
+            lines.append(f"LoRA: {params.lora_path}, scale: {params.lora_scale}")
         return "\n".join(lines)
-
-    # ----------------------------------------------------------------
-    # 辅助
-    # ----------------------------------------------------------------
 
     def _get_cn_processor(self) -> ControlNetProcessor:
         if self.cn_processor is None:
@@ -324,7 +339,6 @@ class AnimePipeline:
         return self.cn_processor
 
     def cleanup(self):
-        """释放所有资源"""
         self.engine.unload_all()
         if self.cn_processor is not None:
             self.cn_processor._preprocessors.clear()

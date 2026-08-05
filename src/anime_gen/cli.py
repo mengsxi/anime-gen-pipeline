@@ -20,8 +20,6 @@
 
 import argparse
 import logging
-import sys
-from pathlib import Path
 
 from .config import load_config
 from .controlnet import ControlMode
@@ -37,12 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     # 生成参数
     p.add_argument("--prompt", "-p", type=str, required=True, help="正向提示词")
     p.add_argument("--negative-prompt", "-n", type=str, default=None, help="负面提示词")
-    p.add_argument("--steps", type=int, default=20, help="推理步数 (默认 20)")
-    p.add_argument("--cfg", type=float, default=7.0, help="CFG scale (默认 7.0)")
-    p.add_argument("--seed", type=int, default=-1, help="随机种子, -1 为随机")
-    p.add_argument("--width", "-W", type=int, default=512, help="宽度 (默认 512)")
-    p.add_argument("--height", "-H", type=int, default=768, help="高度 (默认 768)")
-    p.add_argument("--batch", "-b", type=int, default=1, help="单次生成数量")
+    p.add_argument("--steps", type=int, default=None, help="推理步数 (默认读取配置)")
+    p.add_argument("--cfg", type=float, default=None, help="CFG scale (默认读取配置)")
+    p.add_argument("--seed", type=int, default=None, help="随机种子, -1 为随机")
+    p.add_argument("--width", "-W", type=int, default=None, help="宽度 (默认读取配置)")
+    p.add_argument("--height", "-H", type=int, default=None, help="高度 (默认读取配置)")
+    p.add_argument("--batch", "-b", type=int, default=None, help="单次生成数量")
 
     # 模式
     p.add_argument("--init-image", "-i", type=str, default=None, help="img2img 初始图片路径")
@@ -59,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-scale", type=float, default=0.75, help="LoRA 强度")
 
     # 输出
-    p.add_argument("--output", "-o", type=str, default="./outputs", help="输出目录")
+    p.add_argument("--output", "-o", type=str, default=None, help="输出目录 (默认读取配置)")
     p.add_argument("--prefix", type=str, default="anime", help="文件名前缀")
     p.add_argument("--no-metadata", action="store_true", help="不嵌入生成参数到 PNG")
 
@@ -82,7 +80,17 @@ def main():
     )
 
     # 加载配置
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
+
+    if bool(args.control_image) != bool(args.control_mode):
+        parser.error("--control-image 和 --control-mode 必须同时提供")
+    if args.mask_image and not args.init_image:
+        parser.error("--mask-image 必须与 --init-image 一起使用")
+    if args.init_image and args.control_image:
+        parser.error("当前 CLI 不支持同时使用 img2img 和 ControlNet")
 
     # 构造参数
     params = GenParams(
@@ -95,11 +103,12 @@ def main():
         seed=args.seed,
         batch_size=args.batch,
         strength=args.strength,
+        control_weight=args.control_weight,
         lora_path=args.lora,
         lora_scale=args.lora_scale,
         output_dir=args.output,
         filename_prefix=args.prefix,
-        save_metadata=not args.no_metadata,
+        save_metadata=False if args.no_metadata else None,
     )
 
     # 加载图片
@@ -134,7 +143,7 @@ def main():
             result = pipe.txt2img(params)
 
         # 报告结果
-        print(f"\n✓ 生成完成!")
+        print("\n✓ 生成完成!")
         print(f"  Seed: {result.seed_used}")
         print(f"  耗时: {result.elapsed:.1f}s")
         print(f"  输出: {len(result.images)} 张图片")

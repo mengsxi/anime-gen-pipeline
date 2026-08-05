@@ -9,18 +9,31 @@ from typing import Optional
 import yaml  # type: ignore
 
 
+DEFAULT_CONTROLNET_MODELS = {
+    "pose": "lllyasviel/control_v11p_sd15_openpose",
+    "lineart": "lllyasviel/control_v11p_sd15_lineart",
+    "scribble": "lllyasviel/control_v11p_sd15_scribble",
+    "canny": "lllyasviel/control_v11p_sd15_canny",
+    "depth": "lllyasviel/control_v11p_sd15_depth",
+    "softedge": "lllyasviel/control_v11p_sd15_softedge",
+}
+
+
 @dataclass
 class ModelConfig:
     base_model_id: str = "andite/anything-v5.0"
     base_model_path: str = "./models/base"
     vae_model_id: Optional[str] = None
-    controlnet: dict = field(default_factory=dict)
+    controlnet: dict[str, str | None] = field(
+        default_factory=lambda: DEFAULT_CONTROLNET_MODELS.copy()
+    )
+    controlnet_dir: str = "./models/controlnet"
     lora_dir: str = "./models/lora"
 
 
 @dataclass
 class InferenceConfig:
-    device: str = "cuda"
+    device: str = "auto"
     torch_dtype: str = "fp16"
     default_steps: int = 20
     default_cfg: float = 7.0
@@ -70,17 +83,25 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     """加载配置文件, 未指定的字段使用默认值"""
     import os
 
+    explicit_path = config_path is not None
     if config_path is None:
-        # 优先找环境变量, 其次找项目下的 configs/default.yaml
-        config_path = os.environ.get(
-            "ANIME_GEN_CONFIG",
-            str(Path(__file__).parent.parent.parent / "configs" / "default.yaml"),
-        )
+        # 优先找环境变量, 其次找源码项目下的 configs/default.yaml。
+        env_path = os.environ.get("ANIME_GEN_CONFIG")
+        if env_path:
+            config_path = env_path
+            explicit_path = True
+        else:
+            config_path = str(
+                Path(__file__).parent.parent.parent / "configs" / "default.yaml"
+            )
 
     config_dict = {}
-    if config_path and Path(config_path).exists():
-        with open(config_path, "r", encoding="utf-8") as f:
+    config_file = Path(config_path) if config_path else None
+    if config_file and config_file.exists():
+        with config_file.open("r", encoding="utf-8") as f:
             config_dict = yaml.safe_load(f) or {}
+    elif explicit_path and config_file:
+        raise FileNotFoundError(f"配置文件不存在: {config_file}")
 
     # 递归合并到 dataclass
     return _dict_to_config(config_dict)
@@ -88,18 +109,37 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 
 def _dict_to_config(d: dict) -> AppConfig:
     """将嵌套字典转为 AppConfig"""
-    models_d = d.get("models", {})
-    inference_d = d.get("inference", {})
-    low_vram_d = d.get("low_vram", {})
-    output_d = d.get("output", {})
-    webui_d = d.get("webui", {})
+    if not isinstance(d, dict):
+        raise ValueError("配置文件根节点必须是 YAML mapping")
+
+    def section(name: str) -> dict:
+        value = d.get(name, {})
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"配置项 '{name}' 必须是 YAML mapping")
+        return value
+
+    models_d = section("models")
+    inference_d = section("inference")
+    low_vram_d = section("low_vram")
+    output_d = section("output")
+    webui_d = section("webui")
+    controlnet_d = models_d.get(
+        "controlnet", DEFAULT_CONTROLNET_MODELS.copy()
+    )
+    if controlnet_d is None:
+        controlnet_d = {}
+    if not isinstance(controlnet_d, dict):
+        raise ValueError("配置项 'models.controlnet' 必须是 YAML mapping")
 
     return AppConfig(
         models=ModelConfig(
             base_model_id=models_d.get("base_model_id", "andite/anything-v5.0"),
             base_model_path=models_d.get("base_model_path", "./models/base"),
             vae_model_id=models_d.get("vae_model_id"),
-            controlnet=models_d.get("controlnet", {}),
+            controlnet=controlnet_d,
+            controlnet_dir=models_d.get("controlnet_dir", "./models/controlnet"),
             lora_dir=models_d.get("lora_dir", "./models/lora"),
         ),
         inference=InferenceConfig(**inference_d) if inference_d else InferenceConfig(),

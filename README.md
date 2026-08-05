@@ -52,6 +52,9 @@ source venv/bin/activate
 
 # 安装
 pip install -e .
+
+# 可选：安装 xformers / ToMe 加速组件
+pip install -e ".[acceleration]"
 ```
 
 ### 下载模型

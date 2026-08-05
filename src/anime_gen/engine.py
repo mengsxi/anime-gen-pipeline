@@ -1,7 +1,8 @@
 """
-模型引擎 — 负责加载/管理 Stable Diffusion + ControlNet 模型
-针对 4-8GB VRAM 做了大量低配优化
+模型引擎 — 负责加载和复用 Stable Diffusion、任务 Pipeline 与 ControlNet。
 """
+
+from __future__ import annotations
 
 import gc
 import logging
@@ -16,185 +17,285 @@ logger = logging.getLogger(__name__)
 
 
 class ModelEngine:
-    """
-    模型引擎: 封装 SD 基础模型 + VAE + ControlNet 的加载与卸载。
-
-    低配优化策略:
-      - attention slicing: 切片计算注意力, ~30% VRAM 节省
-      - VAE slicing/tiling: 分块编解码, 大图必备
-      - CPU offload: 逐模块卸载到 CPU (极低 VRAM)
-      - Token Merging (ToMe): 合并冗余 token 加速推理
-      - xformers: 高效注意力实现
-    """
+    """按需创建任务 Pipeline，并共享基础模型组件。"""
 
     def __init__(self, config: Optional[AppConfig] = None):
         self.config = config or get_config()
         self._pipe: Any = None
-        self._controlnet_models: dict[str, Any] = {}
+        self._task_pipes: dict[str, Any] = {}
+        self._control_pipe: Any = None
+        self._controlnet_model: Any = None
+        self._controlnet_mode: Optional[str] = None
+        self._device = self._resolve_device()
         self._dtype = self._resolve_dtype()
-        self._device = self.config.inference.device
-
-    # ----------------------------------------------------------------
-    # 公开 API
-    # ----------------------------------------------------------------
 
     @property
     def pipe(self):
-        """延迟加载 pipeline"""
+        """延迟加载文生图 Pipeline，保留原有公开属性。"""
         if self._pipe is None:
             self._load_base_pipeline()
         return self._pipe
 
-    def load_controlnet(self, mode: str) -> Any:
-        """
-        按需加载单个 ControlNet 模型
+    def get_pipeline(self, mode: str = "txt2img", control_mode: str | None = None):
+        """返回与任务匹配的 Pipeline，模型组件不会重复分配。"""
+        if control_mode is not None:
+            if mode != "txt2img":
+                raise ValueError("当前仅支持 txt2img + ControlNet")
+            return self._get_controlnet_pipeline(control_mode)
 
-        Args:
-            mode: 'pose' | 'lineart' | 'scribble' | 'canny' | 'depth' | 'softedge'
-        """
-        if mode in self._controlnet_models:
-            return self._controlnet_models[mode]
+        if mode == "txt2img":
+            return self.pipe
+        if mode in self._task_pipes:
+            return self._task_pipes[mode]
+
+        from diffusers import AutoPipelineForImage2Image, AutoPipelineForInpainting
+
+        factories = {
+            "img2img": AutoPipelineForImage2Image,
+            "inpaint": AutoPipelineForInpainting,
+        }
+        try:
+            factory = factories[mode]
+        except KeyError as exc:
+            raise ValueError(f"未知模式: {mode}") from exc
+
+        logger.info("创建任务 Pipeline: %s", mode)
+        task_pipe = factory.from_pipe(self.pipe)
+        self._task_pipes[mode] = task_pipe
+        return task_pipe
+
+    def load_controlnet(self, mode: str) -> Any:
+        """只保留当前 ControlNet，切换模式时释放上一套权重。"""
+        if self._controlnet_mode == mode and self._controlnet_model is not None:
+            return self._controlnet_model
+
+        self._release_controlnet()
 
         from diffusers import ControlNetModel
 
-        cn_config = self.config.models.controlnet
-        model_id = cn_config.get(mode)
-        if model_id is None:
+        model_id = self.config.models.controlnet.get(mode)
+        if not model_id:
             raise ValueError(
-                f"ControlNet mode '{mode}' 未配置模型ID, "
-                f"请在 configs/default.yaml 中设置 models.controlnet.{mode}"
+                f"ControlNet mode '{mode}' 未配置模型 ID，请设置 "
+                f"models.controlnet.{mode}"
             )
 
-        logger.info(f"加载 ControlNet [{mode}]: {model_id}")
-        cn = ControlNetModel.from_pretrained(
-            model_id,
+        local_path = Path(self.config.models.controlnet_dir) / mode
+        load_from = (
+            str(local_path)
+            if self._model_dir_ready(local_path, "config.json")
+            else model_id
+        )
+        logger.info("加载 ControlNet [%s]: %s", mode, load_from)
+        controlnet = ControlNetModel.from_pretrained(
+            load_from,
             torch_dtype=self._dtype,
             use_safetensors=True,
-        ).to(self._device)
+        )
 
-        self._controlnet_models[mode] = cn
-        return cn
+        lv = self.config.low_vram
+        if not (lv.enable_model_cpu_offload or lv.enable_sequential_cpu_offload):
+            controlnet = controlnet.to(self._device)
+
+        self._controlnet_model = controlnet
+        self._controlnet_mode = mode
+        return controlnet
 
     def unload_all(self):
-        """释放所有模型, 释放 VRAM"""
+        """释放所有模型和任务包装器。"""
         logger.info("释放所有模型...")
+        self._task_pipes.clear()
+        self._release_controlnet(empty_cache=False)
         self._pipe = None
-        self._controlnet_models.clear()
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        self._empty_cuda_cache()
 
     def get_vram_info(self) -> str:
-        """获取当前 VRAM 使用情况"""
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            return f"VRAM: {allocated:.1f}G used / {reserved:.1f}G reserved / {total:.1f}G total"
-        return "VRAM: N/A (CPU mode)"
+        """获取当前 CUDA 设备的显存使用情况。"""
+        if self._device.startswith("cuda") and torch.cuda.is_available():
+            device = torch.device(self._device)
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(index) / 1024**3
+            reserved = torch.cuda.memory_reserved(index) / 1024**3
+            total = torch.cuda.get_device_properties(index).total_memory / 1024**3
+            return (
+                f"VRAM: {allocated:.1f}G used / {reserved:.1f}G reserved / "
+                f"{total:.1f}G total"
+            )
+        return f"VRAM: N/A ({self._device} mode)"
 
     def get_torch_dtype_str(self) -> str:
-        return self.config.inference.torch_dtype
+        mapping = {
+            torch.float16: "fp16",
+            torch.float32: "fp32",
+            torch.bfloat16: "bf16",
+        }
+        return mapping[self._dtype]
 
     def get_device(self) -> str:
         return self._device
 
-    # ----------------------------------------------------------------
-    # 内部实现
-    # ----------------------------------------------------------------
+    def get_generator_device(self) -> str:
+        # MPS 使用 CPU Generator 可获得更稳定的可复现行为。
+        return "cpu" if self._device == "mps" else self._device
+
+    def _get_controlnet_pipeline(self, mode: str):
+        if self._control_pipe is not None and self._controlnet_mode == mode:
+            return self._control_pipe
+
+        from diffusers import StableDiffusionControlNetPipeline
+
+        controlnet = self.load_controlnet(mode)
+        control_pipe = StableDiffusionControlNetPipeline.from_pipe(
+            self.pipe,
+            controlnet=controlnet,
+        )
+
+        lv = self.config.low_vram
+        if lv.enable_model_cpu_offload:
+            control_pipe.enable_model_cpu_offload()
+        elif lv.enable_sequential_cpu_offload:
+            control_pipe.enable_sequential_cpu_offload()
+
+        if lv.enable_xformers and self._device.startswith("cuda"):
+            try:
+                control_pipe.enable_xformers_memory_efficient_attention()
+            except Exception as exc:  # xformers 是可选加速项
+                logger.warning("ControlNet xformers 不可用: %s", exc)
+
+        self._control_pipe = control_pipe
+        return control_pipe
+
+    def _resolve_device(self) -> str:
+        requested = self.config.inference.device.lower()
+        if requested == "auto":
+            if torch.cuda.is_available():
+                return "cuda"
+            mps = getattr(torch.backends, "mps", None)
+            if mps is not None and mps.is_available():
+                return "mps"
+            return "cpu"
+
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("CUDA 不可用，自动回退到 CPU")
+            return "cpu"
+        if requested == "mps":
+            mps = getattr(torch.backends, "mps", None)
+            if mps is None or not mps.is_available():
+                logger.warning("MPS 不可用，自动回退到 CPU")
+                return "cpu"
+        if requested != "cpu" and requested != "mps" and not requested.startswith("cuda"):
+            raise ValueError(f"不支持的推理设备: {requested}")
+        return requested
 
     def _resolve_dtype(self) -> torch.dtype:
-        dtype_str = self.config.inference.torch_dtype
+        dtype_str = self.config.inference.torch_dtype.lower()
         mapping = {
             "fp16": torch.float16,
             "fp32": torch.float32,
             "bf16": torch.bfloat16,
         }
-        return mapping.get(dtype_str, torch.float16)
+        if dtype_str not in mapping:
+            raise ValueError(f"不支持的 torch_dtype: {dtype_str}")
+
+        dtype = mapping[dtype_str]
+        if self._device == "cpu" and dtype == torch.float16:
+            logger.warning("CPU 不适合 fp16 推理，自动使用 fp32")
+            return torch.float32
+        if self._device == "mps" and dtype == torch.bfloat16:
+            logger.warning("MPS 不支持 bf16，自动使用 fp16")
+            return torch.float16
+        return dtype
 
     def _load_base_pipeline(self):
-        """加载 SD 1.5 基础 pipeline + 低配优化"""
+        """加载 SD 基础 Pipeline，再统一应用运行时优化。"""
         from diffusers import StableDiffusionPipeline
 
         model_id = self.config.models.base_model_id
         local_path = Path(self.config.models.base_model_path)
-
-        logger.info(f"加载基础模型: {model_id}")
-
-        # 优先本地, 其次 HF hub
-        load_from = str(local_path) if local_path.exists() else model_id
+        load_from = (
+            str(local_path)
+            if self._model_dir_ready(local_path, "model_index.json")
+            else model_id
+        )
+        logger.info("加载基础模型: %s", load_from)
 
         pipe = StableDiffusionPipeline.from_pretrained(
             load_from,
             torch_dtype=self._dtype,
-            safety_checker=None,          # 动漫场景不需要
+            safety_checker=None,
             requires_safety_checker=False,
             use_safetensors=True,
         )
 
-        # --- 低配优化步骤 ---
-        lv = self.config.low_vram
-
-        if lv.enable_attention_slicing:
-            pipe.enable_attention_slicing()
-            logger.info("  ✓ attention slicing")
-
-        if lv.enable_vae_slicing:
-            pipe.enable_vae_slicing()
-            logger.info("  ✓ VAE slicing")
-
-        if lv.enable_vae_tiling:
-            pipe.vae.enable_tiling()
-            logger.info("  ✓ VAE tiling")
-
-        if lv.enable_xformers and self._device.startswith("cuda"):
-            try:
-                pipe.enable_xformers_memory_efficient_attention()
-                logger.info("  ✓ xformers")
-            except Exception as e:
-                logger.warning(f"  ✗ xformers 不可用: {e}")
-
-        if lv.enable_model_cpu_offload:
-            pipe.enable_model_cpu_offload()
-            logger.info("  ✓ model CPU offload")
-
-        elif lv.enable_sequential_cpu_offload:
-            pipe.enable_sequential_cpu_offload()
-            logger.info("  ✓ sequential CPU offload")
-
-        else:
-            # 默认移到 GPU
-            pipe = pipe.to(self._device)
-
-        # Token Merging (可选)
-        if lv.enable_tome:
-            self._apply_tome(pipe, lv.tome_ratio)
-            logger.info(f"  ✓ ToMe (ratio={lv.tome_ratio})")
-
-        # 可选外部 VAE
         if self.config.models.vae_model_id:
             from diffusers import AutoencoderKL
 
-            logger.info(f"加载外部 VAE: {self.config.models.vae_model_id}")
-            vae = AutoencoderKL.from_pretrained(
+            logger.info("加载外部 VAE: %s", self.config.models.vae_model_id)
+            pipe.vae = AutoencoderKL.from_pretrained(
                 self.config.models.vae_model_id,
                 torch_dtype=self._dtype,
             )
-            pipe.vae = vae.to(self._device)
 
+        self._apply_runtime_optimizations(pipe)
         self._pipe = pipe
-        logger.info(f"模型加载完成 — {self.get_vram_info()}")
+        logger.info("模型加载完成 — %s", self.get_vram_info())
+
+    def _apply_runtime_optimizations(self, pipe):
+        lv = self.config.low_vram
+
+        if lv.enable_vae_slicing:
+            pipe.enable_vae_slicing()
+        if lv.enable_vae_tiling:
+            pipe.vae.enable_tiling()
+
+        xformers_enabled = False
+        if lv.enable_xformers and self._device.startswith("cuda"):
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                xformers_enabled = True
+            except Exception as exc:
+                logger.warning("xformers 不可用，继续使用 PyTorch attention: %s", exc)
+        if lv.enable_attention_slicing and not xformers_enabled:
+            pipe.enable_attention_slicing()
+
+        if lv.enable_model_cpu_offload:
+            pipe.enable_model_cpu_offload()
+        elif lv.enable_sequential_cpu_offload:
+            pipe.enable_sequential_cpu_offload()
+        else:
+            pipe.to(self._device)
+
+        if lv.enable_tome:
+            self._apply_tome(pipe, lv.tome_ratio)
+
+    def _release_controlnet(self, empty_cache: bool = True):
+        if self._controlnet_model is not None and self._device.startswith("cuda"):
+            try:
+                self._controlnet_model.to("cpu")
+            except Exception:
+                logger.debug("ControlNet 移回 CPU 失败，将直接释放引用", exc_info=True)
+        self._control_pipe = None
+        self._controlnet_model = None
+        self._controlnet_mode = None
+        gc.collect()
+        if empty_cache:
+            self._empty_cuda_cache()
 
     @staticmethod
     def _apply_tome(pipe, ratio: float):
-        """应用 Token Merging 加速"""
         try:
             import tomesd  # type: ignore
 
-            tomesd.apply_patched(pipe, ratio=ratio)
+            tomesd.apply_patch(pipe, ratio=ratio)
         except ImportError:
-            logger.warning("tomesd 未安装, 跳过 Token Merging")
+            logger.warning("tomesd 未安装，跳过 Token Merging")
 
-    # xformers 由 low_vram.enable_xformers 配置控制
+    @staticmethod
+    def _empty_cuda_cache():
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
+    @staticmethod
+    def _model_dir_ready(path: Path, marker: str) -> bool:
+        return (path / marker).exists() and any(path.rglob("*.safetensors"))

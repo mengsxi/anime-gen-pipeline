@@ -16,12 +16,13 @@ models:
     canny:   "lllyasviel/control_v11p_sd15_canny"
     depth:   "lllyasviel/control_v11p_sd15_depth"
     softedge: "lllyasviel/control_v11p_sd15_softedge"
+  controlnet_dir: "./models/controlnet"        # ControlNet 本地缓存目录
 
   lora_dir: "./models/lora"                    # LoRA 模型目录
 
 # --- 推理参数 ---
 inference:
-  device: "cuda"          # cuda / cpu / mps
+  device: "auto"          # auto / cuda / cpu / mps
   torch_dtype: "fp16"     # fp16 / fp32 / bf16
   default_steps: 20
   default_cfg: 7.0
