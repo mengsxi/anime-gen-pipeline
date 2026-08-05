@@ -41,15 +41,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--width", "-W", type=int, default=None, help="宽度 (默认读取配置)")
     p.add_argument("--height", "-H", type=int, default=None, help="高度 (默认读取配置)")
     p.add_argument("--batch", "-b", type=int, default=None, help="单次生成数量")
+    p.add_argument(
+        "--clip-skip", type=int, default=None, help="CLIP 跳层数 (默认读取配置)"
+    )
 
     # 模式
-    p.add_argument("--init-image", "-i", type=str, default=None, help="img2img 初始图片路径")
+    p.add_argument(
+        "--init-image", "-i", type=str, default=None, help="img2img 初始图片路径"
+    )
     p.add_argument("--strength", type=float, default=0.75, help="img2img 重绘强度")
-    p.add_argument("--mask-image", "-m", type=str, default=None, help="inpaint 蒙版图片路径")
-    p.add_argument("--control-image", "-c", type=str, default=None, help="ControlNet 条件图路径")
-    p.add_argument("--control-mode", type=str, default=None,
-                   choices=[m.value for m in ControlMode],
-                   help="ControlNet 模式")
+    p.add_argument(
+        "--mask-image", "-m", type=str, default=None, help="inpaint 蒙版图片路径"
+    )
+    p.add_argument(
+        "--control-image", "-c", type=str, default=None, help="ControlNet 条件图路径"
+    )
+    p.add_argument(
+        "--control-mode",
+        type=str,
+        default=None,
+        choices=[m.value for m in ControlMode],
+        help="ControlNet 模式",
+    )
     p.add_argument("--control-weight", type=float, default=0.8, help="ControlNet 权重")
 
     # LoRA
@@ -57,7 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora-scale", type=float, default=0.75, help="LoRA 强度")
 
     # 输出
-    p.add_argument("--output", "-o", type=str, default=None, help="输出目录 (默认读取配置)")
+    p.add_argument(
+        "--output", "-o", type=str, default=None, help="输出目录 (默认读取配置)"
+    )
     p.add_argument("--prefix", type=str, default="anime", help="文件名前缀")
     p.add_argument("--no-metadata", action="store_true", help="不嵌入生成参数到 PNG")
 
@@ -102,6 +117,7 @@ def main():
         cfg_scale=args.cfg,
         seed=args.seed,
         batch_size=args.batch,
+        clip_skip=args.clip_skip,
         strength=args.strength,
         control_weight=args.control_weight,
         lora_path=args.lora,
@@ -114,14 +130,17 @@ def main():
     # 加载图片
     if args.init_image:
         from PIL import Image
+
         params.init_image = Image.open(args.init_image).convert("RGB")
 
     if args.mask_image:
         from PIL import Image
+
         params.mask_image = Image.open(args.mask_image).convert("L")
 
     if args.control_image:
         from PIL import Image
+
         control_img = Image.open(args.control_image).convert("RGB")
 
     # 初始化 Pipeline
@@ -151,6 +170,17 @@ def main():
         for path in result.metadata.get("saved_paths", []):
             print(f"    → {path}")
 
+    except KeyboardInterrupt:
+        parser.exit(130, "\n生成已取消\n")
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            parser.exit(
+                2,
+                "显存不足：请降低尺寸/批量，或在配置中开启 model CPU offload。\n",
+            )
+        if args.verbose:
+            logging.exception("生成失败")
+        parser.exit(1, f"生成失败: {exc}\n")
     finally:
         pipe.cleanup()
 

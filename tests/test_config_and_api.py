@@ -25,7 +25,11 @@ def test_builtin_defaults_include_controlnet_models(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(config_module, "__file__", str(tmp_path / "pkg" / "config.py"))
     config = config_module.load_config()
     assert config.models.controlnet == DEFAULT_CONTROLNET_MODELS
+    assert config.models.base_model_id == "Yntec/AnythingV5"
     assert config.inference.device == "auto"
+    assert config.inference.scheduler == "dpmpp_2m_karras"
+    assert config.low_vram.enable_attention_slicing is False
+    assert config.low_vram.enable_xformers is False
 
 
 def test_invalid_config_section_has_clear_error(tmp_path: Path):

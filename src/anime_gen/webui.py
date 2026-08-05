@@ -1,28 +1,183 @@
-"""
-Gradio Web UI — 提供可视化的动漫图像生成交互界面
+"""Gradio WebUI。"""
 
-运行:
-    python -m anime_gen.webui
-    或
-    anime-gen-webui
-"""
+from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from .config import AppConfig, load_config
 from .controlnet import ControlMode
-from .pipeline import AnimePipeline, GenParams
+from .pipeline import DEFAULT_NEGATIVE_PROMPT, AnimePipeline, GenParams
 
 logger = logging.getLogger(__name__)
 
 
 def create_ui(config: AppConfig | None = None):
-    """构建 Gradio 界面"""
-    import gradio as gr
+    """构建 WebUI；所有模型事件共享一个串行队列。"""
+    try:
+        import gradio as gr
+    except ImportError as exc:
+        raise RuntimeError(
+            'WebUI 依赖未安装，请运行: pip install -e ".[webui]"'
+        ) from exc
 
     config = config or load_config()
+    pipe_holder = {"pipeline": None}
+    gpu_event = {"concurrency_id": "anime_gpu", "concurrency_limit": 1}
+    lora_dir = Path(config.models.lora_dir)
+    lora_choices = (
+        [str(path) for path in sorted(lora_dir.glob("*.safetensors"))]
+        if lora_dir.exists()
+        else []
+    )
 
-    # --- 自定义 CSS ---
+    def get_pipeline() -> AnimePipeline:
+        if pipe_holder["pipeline"] is None:
+            pipe_holder["pipeline"] = AnimePipeline(config)
+        return pipe_holder["pipeline"]
+
+    def make_progress_callback(progress):
+        def callback(current: int, total: int):
+            progress(
+                min(0.95, 0.2 + 0.75 * current / max(total, 1)),
+                desc=f"采样 {current}/{total}",
+            )
+
+        return callback
+
+    def common_params(
+        prompt, negative_prompt, width, height, steps, cfg, seed, clip_skip
+    ):
+        return GenParams(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=int(width),
+            height=int(height),
+            steps=int(steps),
+            cfg_scale=float(cfg),
+            seed=int(seed),
+            clip_skip=int(clip_skip) if clip_skip else None,
+        )
+
+    def on_generate_txt2img(
+        prompt,
+        negative_prompt,
+        width,
+        height,
+        steps,
+        cfg,
+        seed,
+        clip_skip,
+        batch_size,
+        lora_path,
+        lora_scale,
+        progress=gr.Progress(),
+    ):
+        pipeline = get_pipeline()
+        params = common_params(
+            prompt, negative_prompt, width, height, steps, cfg, seed, clip_skip
+        )
+        params.batch_size = int(batch_size)
+        params.lora_path = (
+            lora_path.strip() if lora_path and lora_path.strip() else None
+        )
+        params.lora_scale = float(lora_scale)
+        progress(0.1, desc="准备模型...")
+        result = pipeline.txt2img(params, make_progress_callback(progress))
+        progress(1.0, desc=f"完成 ({result.elapsed:.1f}s)")
+        return result.images, pipeline.engine.get_vram_info(), result.seed_used
+
+    def on_generate_img2img(
+        prompt,
+        negative_prompt,
+        init_image,
+        strength,
+        width,
+        height,
+        steps,
+        cfg,
+        seed,
+        clip_skip,
+        progress=gr.Progress(),
+    ):
+        if init_image is None:
+            raise gr.Error("请上传初始图片")
+        pipeline = get_pipeline()
+        params = common_params(
+            prompt, negative_prompt, width, height, steps, cfg, seed, clip_skip
+        )
+        params.init_image = init_image
+        params.strength = float(strength)
+        progress(0.1, desc="准备模型...")
+        result = pipeline.img2img(params, make_progress_callback(progress))
+        progress(1.0, desc=f"完成 ({result.elapsed:.1f}s)")
+        return result.images[0], pipeline.engine.get_vram_info(), result.seed_used
+
+    def on_generate_inpaint(
+        prompt,
+        negative_prompt,
+        init_image,
+        mask_image,
+        strength,
+        width,
+        height,
+        steps,
+        cfg,
+        seed,
+        clip_skip,
+        progress=gr.Progress(),
+    ):
+        if init_image is None or mask_image is None:
+            raise gr.Error("请同时上传原图和蒙版")
+        pipeline = get_pipeline()
+        params = common_params(
+            prompt, negative_prompt, width, height, steps, cfg, seed, clip_skip
+        )
+        params.init_image = init_image
+        params.mask_image = mask_image.convert("L")
+        params.strength = float(strength)
+        progress(0.1, desc="准备模型...")
+        result = pipeline.inpaint(params, make_progress_callback(progress))
+        progress(1.0, desc=f"完成 ({result.elapsed:.1f}s)")
+        return result.images[0], pipeline.engine.get_vram_info(), result.seed_used
+
+    def on_generate_control(
+        prompt,
+        negative_prompt,
+        control_image,
+        control_mode,
+        control_weight,
+        width,
+        height,
+        steps,
+        cfg,
+        seed,
+        clip_skip,
+        progress=gr.Progress(),
+    ):
+        if control_image is None:
+            raise gr.Error("请上传 ControlNet 条件图")
+        pipeline = get_pipeline()
+        params = common_params(
+            prompt, negative_prompt, width, height, steps, cfg, seed, clip_skip
+        )
+        params.control_weight = float(control_weight)
+        progress(0.05, desc="预处理条件图...")
+        result = pipeline.generate_with_control(
+            params,
+            control_image=control_image,
+            control_mode=control_mode,
+            progress_callback=make_progress_callback(progress),
+        )
+        progress(1.0, desc=f"完成 ({result.elapsed:.1f}s)")
+        return result.images[0], pipeline.engine.get_vram_info(), result.seed_used
+
+    def on_unload():
+        if pipe_holder["pipeline"] is not None:
+            pipe_holder["pipeline"].cleanup()
+            pipe_holder["pipeline"] = None
+        return "模型已卸载", "VRAM 已释放"
+
     css = """
     .anime-title {
         text-align: center;
@@ -31,115 +186,9 @@ def create_ui(config: AppConfig | None = None):
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        margin-bottom: 10px;
     }
-    .anime-subtitle {
-        text-align: center;
-        color: #888;
-        margin-bottom: 20px;
-    }
-    .vram-info {
-        color: #4ade80;
-        font-weight: bold;
-    }
+    .anime-subtitle { text-align: center; color: #888; margin-bottom: 20px; }
     """
-
-    pipe_holder = {"pipeline": None}
-
-    def get_pipeline():
-        if pipe_holder["pipeline"] is None:
-            pipe_holder["pipeline"] = AnimePipeline(config)
-        return pipe_holder["pipeline"]
-
-    # ================================================================
-    # 事件处理
-    # ================================================================
-
-    def on_generate_txt2img(
-        prompt, negative_prompt, width, height, steps, cfg, seed, batch_size,
-        progress=gr.Progress(),
-    ):
-        pipe = get_pipeline()
-        params = GenParams(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=int(width),
-            height=int(height),
-            steps=int(steps),
-            cfg_scale=float(cfg),
-            seed=int(seed),
-            batch_size=int(batch_size),
-        )
-        progress(0.3, desc="生成中...")
-        result = pipe.txt2img(params)
-        progress(1.0, desc=f"完成 ({result.elapsed:.1f}s, seed={result.seed_used})")
-        vram = pipe.engine.get_vram_info()
-        return result.images[0], vram, result.seed_used
-
-    def on_generate_img2img(
-        prompt, negative_prompt, init_image, strength,
-        width, height, steps, cfg, seed,
-        progress=gr.Progress(),
-    ):
-        if init_image is None:
-            raise gr.Error("请上传初始图片")
-
-        pipe = get_pipeline()
-        params = GenParams(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=int(width),
-            height=int(height),
-            steps=int(steps),
-            cfg_scale=float(cfg),
-            seed=int(seed),
-            init_image=init_image,
-            strength=float(strength),
-        )
-        progress(0.3, desc="生成中...")
-        result = pipe.img2img(params)
-        progress(1.0, desc=f"完成 ({result.elapsed:.1f}s)")
-        vram = pipe.engine.get_vram_info()
-        return result.images[0], vram, result.seed_used
-
-    def on_generate_control(
-        prompt, negative_prompt, control_image, control_mode, control_weight,
-        width, height, steps, cfg, seed,
-        progress=gr.Progress(),
-    ):
-        if control_image is None:
-            raise gr.Error("请上传 ControlNet 条件图")
-
-        pipe = get_pipeline()
-        params = GenParams(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            width=int(width),
-            height=int(height),
-            steps=int(steps),
-            cfg_scale=float(cfg),
-            seed=int(seed),
-            control_weight=float(control_weight),
-        )
-        progress(0.2, desc="预处理条件图...")
-        result = pipe.generate_with_control(
-            params,
-            control_image=control_image,
-            control_mode=control_mode,
-        )
-        progress(1.0, desc=f"完成 ({result.elapsed:.1f}s)")
-        vram = pipe.engine.get_vram_info()
-        return result.images[0], vram, result.seed_used
-
-    def on_unload():
-        if pipe_holder["pipeline"] is not None:
-            pipe_holder["pipeline"].cleanup()
-            pipe_holder["pipeline"] = None
-        return "模型已卸载", "VRAM 已释放"
-
-    # ================================================================
-    # 界面布局
-    # ================================================================
 
     with gr.Blocks(
         css=css,
@@ -147,210 +196,225 @@ def create_ui(config: AppConfig | None = None):
         theme=config.webui.theme,
     ) as demo:
         gr.HTML('<div class="anime-title">Anime Gen Pipeline</div>')
-        gr.HTML('<div class="anime-subtitle">2D 动漫可控图像生成 · 低配 PC 优化版</div>')
-
+        gr.HTML(
+            '<div class="anime-subtitle">2D 动漫可控图像生成 · 低配 PC 优化版</div>'
+        )
         vram_display = gr.Textbox(
-            label="VRAM 状态",
-            value="模型未加载",
-            interactive=False,
+            label="设备状态", value="模型未加载", interactive=False
         )
 
+        with gr.Accordion("全局生成设置", open=False):
+            with gr.Row():
+                width = gr.Slider(
+                    256,
+                    1024,
+                    value=config.inference.default_width,
+                    step=64,
+                    label="宽度",
+                )
+                height = gr.Slider(
+                    256,
+                    1024,
+                    value=config.inference.default_height,
+                    step=64,
+                    label="高度",
+                )
+            with gr.Row():
+                steps = gr.Slider(
+                    1,
+                    50,
+                    value=config.inference.default_steps,
+                    step=1,
+                    label="采样步数",
+                )
+                cfg = gr.Slider(
+                    0.0, 15.0, value=config.inference.default_cfg, step=0.5, label="CFG"
+                )
+                clip_skip = gr.Number(
+                    value=config.inference.clip_skip or 0,
+                    precision=0,
+                    label="Clip Skip (0=关闭)",
+                )
+
+        common_generation_inputs = [width, height, steps, cfg]
+
         with gr.Tabs():
-            # ==================== Tab 1: 文生图 ====================
-            with gr.TabItem("文生图 (txt2img)"):
+            with gr.TabItem("文生图"):
                 with gr.Row():
                     with gr.Column(scale=2):
-                        txt2img_prompt = gr.Textbox(
-                            label="提示词 (Prompt)",
-                            placeholder="1girl, solo, long hair, blue eyes, "
-                                        "school uniform, looking at viewer, "
-                                        "masterpiece, best quality, 8k",
-                            lines=3,
-                        )
-                        txt2img_neg = gr.Textbox(
-                            label="负面提示词",
-                            value="lowres, bad anatomy, bad hands, extra fingers, "
-                                  "worst quality, low quality, ugly, deformed",
-                            lines=2,
+                        txt_prompt = gr.Textbox(label="提示词", lines=3)
+                        txt_negative = gr.Textbox(
+                            label="负面提示词", value=DEFAULT_NEGATIVE_PROMPT, lines=2
                         )
                         with gr.Row():
-                            txt2img_seed = gr.Number(
+                            txt_seed = gr.Number(
                                 label="Seed (-1=随机)",
                                 value=config.inference.default_seed,
                                 precision=0,
                             )
-                            txt2img_batch = gr.Slider(
-                                1,
-                                4,
-                                value=config.inference.default_batch_size,
-                                step=1,
-                                label="Batch Size",
+                            txt_batch = gr.Slider(1, 4, value=1, step=1, label="批量")
+                        with gr.Accordion("LoRA", open=False):
+                            txt_lora = gr.Dropdown(
+                                choices=lora_choices,
+                                value=None,
+                                label="LoRA（来自配置目录）",
                             )
-                        with gr.Row():
-                            txt2img_btn = gr.Button("生成", variant="primary", scale=3)
-                            txt2img_seed_out = gr.Number(label="实际 Seed", interactive=False)
-
+                            txt_lora_scale = gr.Slider(
+                                0.0, 1.5, value=0.75, step=0.05, label="LoRA 强度"
+                            )
+                        txt_button = gr.Button("生成", variant="primary")
+                        txt_seed_out = gr.Number(label="实际 Seed", interactive=False)
                     with gr.Column(scale=1):
-                        txt2img_out = gr.Image(label="生成结果", type="pil", height=400)
-
-                with gr.Accordion("高级设置", open=False):
-                    with gr.Row():
-                        txt2img_w = gr.Slider(
-                            256,
-                            1024,
-                            value=config.inference.default_width,
-                            step=64,
-                            label="宽度",
+                        txt_output = gr.Gallery(
+                            label="生成结果", type="pil", columns=2, height=500
                         )
-                        txt2img_h = gr.Slider(
-                            256,
-                            1024,
-                            value=config.inference.default_height,
-                            step=64,
-                            label="高度",
-                        )
-                    with gr.Row():
-                        txt2img_steps = gr.Slider(
-                            1,
-                            50,
-                            value=config.inference.default_steps,
-                            step=1,
-                            label="步数",
-                        )
-                        txt2img_cfg = gr.Slider(
-                            0.0,
-                            15.0,
-                            value=config.inference.default_cfg,
-                            step=0.5,
-                            label="CFG Scale",
-                        )
-
-                txt2img_btn.click(
+                txt_button.click(
                     fn=on_generate_txt2img,
                     inputs=[
-                        txt2img_prompt, txt2img_neg,
-                        txt2img_w, txt2img_h, txt2img_steps, txt2img_cfg,
-                        txt2img_seed, txt2img_batch,
+                        txt_prompt,
+                        txt_negative,
+                        *common_generation_inputs,
+                        txt_seed,
+                        clip_skip,
+                        txt_batch,
+                        txt_lora,
+                        txt_lora_scale,
                     ],
-                    outputs=[txt2img_out, vram_display, txt2img_seed_out],
+                    outputs=[txt_output, vram_display, txt_seed_out],
+                    **gpu_event,
                 )
 
-            # ==================== Tab 2: 图生图 ====================
-            with gr.TabItem("图生图 (img2img)"):
+            with gr.TabItem("图生图"):
+                img_prompt = gr.Textbox(label="提示词", lines=3)
+                img_negative = gr.Textbox(
+                    label="负面提示词", value=DEFAULT_NEGATIVE_PROMPT, lines=2
+                )
                 with gr.Row():
-                    with gr.Column(scale=2):
-                        img2img_prompt = gr.Textbox(label="提示词", lines=3)
-                        img2img_neg = gr.Textbox(label="负面提示词", lines=2)
-                        with gr.Row():
-                            img2img_strength = gr.Slider(
-                                0.1, 1.0, value=0.75, step=0.05, label="重绘强度"
-                            )
-                            img2img_seed = gr.Number(
-                                label="Seed",
-                                value=config.inference.default_seed,
-                                precision=0,
-                            )
-                        with gr.Row():
-                            img2img_btn = gr.Button("生成", variant="primary")
-                            img2img_seed_out = gr.Number(label="实际 Seed", interactive=False)
-
-                    with gr.Column(scale=1):
-                        img2img_init = gr.Image(label="初始图片", type="pil")
-                        img2img_out = gr.Image(label="生成结果", type="pil")
-
-                img2img_btn.click(
+                    img_init = gr.Image(label="初始图片", type="pil")
+                    img_output = gr.Image(label="生成结果", type="pil")
+                with gr.Row():
+                    img_strength = gr.Slider(0.0, 1.0, value=0.75, label="重绘强度")
+                    img_seed = gr.Number(
+                        label="Seed", value=config.inference.default_seed, precision=0
+                    )
+                    img_seed_out = gr.Number(label="实际 Seed", interactive=False)
+                img_button = gr.Button("生成", variant="primary")
+                img_button.click(
                     fn=on_generate_img2img,
                     inputs=[
-                        img2img_prompt, img2img_neg, img2img_init, img2img_strength,
-                        txt2img_w, txt2img_h, txt2img_steps, txt2img_cfg, img2img_seed,
+                        img_prompt,
+                        img_negative,
+                        img_init,
+                        img_strength,
+                        *common_generation_inputs,
+                        img_seed,
+                        clip_skip,
                     ],
-                    outputs=[img2img_out, vram_display, img2img_seed_out],
+                    outputs=[img_output, vram_display, img_seed_out],
+                    **gpu_event,
                 )
 
-            # ==================== Tab 3: ControlNet ====================
-            with gr.TabItem("ControlNet 可控生成"):
+            with gr.TabItem("局部重绘"):
+                paint_prompt = gr.Textbox(label="提示词", lines=3)
+                paint_negative = gr.Textbox(
+                    label="负面提示词", value=DEFAULT_NEGATIVE_PROMPT, lines=2
+                )
                 with gr.Row():
-                    with gr.Column(scale=2):
-                        cn_prompt = gr.Textbox(label="提示词", lines=3)
-                        cn_neg = gr.Textbox(label="负面提示词", lines=2)
-                        cn_mode = gr.Dropdown(
-                            choices=[m.value for m in ControlMode],
-                            value="lineart",
-                            label="控制模式",
-                        )
-                        cn_weight = gr.Slider(
-                            0.1, 1.5, value=0.8, step=0.05, label="ControlNet 权重"
-                        )
-                        with gr.Row():
-                            cn_seed = gr.Number(
-                                label="Seed",
-                                value=config.inference.default_seed,
-                                precision=0,
-                            )
-                            cn_btn = gr.Button("生成", variant="primary")
-                            cn_seed_out = gr.Number(label="实际 Seed", interactive=False)
+                    paint_init = gr.Image(label="原图", type="pil")
+                    paint_mask = gr.Image(
+                        label="蒙版（白色区域重绘）", type="pil", image_mode="L"
+                    )
+                    paint_output = gr.Image(label="生成结果", type="pil")
+                with gr.Row():
+                    paint_strength = gr.Slider(0.0, 1.0, value=0.75, label="重绘强度")
+                    paint_seed = gr.Number(
+                        label="Seed", value=config.inference.default_seed, precision=0
+                    )
+                    paint_seed_out = gr.Number(label="实际 Seed", interactive=False)
+                paint_button = gr.Button("局部重绘", variant="primary")
+                paint_button.click(
+                    fn=on_generate_inpaint,
+                    inputs=[
+                        paint_prompt,
+                        paint_negative,
+                        paint_init,
+                        paint_mask,
+                        paint_strength,
+                        *common_generation_inputs,
+                        paint_seed,
+                        clip_skip,
+                    ],
+                    outputs=[paint_output, vram_display, paint_seed_out],
+                    **gpu_event,
+                )
 
-                    with gr.Column(scale=1):
-                        cn_image = gr.Image(label="条件输入图 (照片/草图)", type="pil")
-                        cn_out = gr.Image(label="生成结果", type="pil")
-
-                cn_btn.click(
+            with gr.TabItem("ControlNet"):
+                control_prompt = gr.Textbox(label="提示词", lines=3)
+                control_negative = gr.Textbox(
+                    label="负面提示词", value=DEFAULT_NEGATIVE_PROMPT, lines=2
+                )
+                with gr.Row():
+                    control_input = gr.Image(label="条件输入图", type="pil")
+                    control_output = gr.Image(label="生成结果", type="pil")
+                with gr.Row():
+                    control_mode = gr.Dropdown(
+                        choices=[mode.value for mode in ControlMode],
+                        value=ControlMode.LINEART.value,
+                        label="控制模式",
+                    )
+                    control_weight = gr.Slider(
+                        0.0, 1.5, value=0.8, step=0.05, label="控制权重"
+                    )
+                    control_seed = gr.Number(
+                        label="Seed", value=config.inference.default_seed, precision=0
+                    )
+                    control_seed_out = gr.Number(label="实际 Seed", interactive=False)
+                control_button = gr.Button("生成", variant="primary")
+                control_button.click(
                     fn=on_generate_control,
                     inputs=[
-                        cn_prompt, cn_neg, cn_image, cn_mode, cn_weight,
-                        txt2img_w, txt2img_h, txt2img_steps, txt2img_cfg, cn_seed,
+                        control_prompt,
+                        control_negative,
+                        control_input,
+                        control_mode,
+                        control_weight,
+                        *common_generation_inputs,
+                        control_seed,
+                        clip_skip,
                     ],
-                    outputs=[cn_out, vram_display, cn_seed_out],
+                    outputs=[control_output, vram_display, control_seed_out],
+                    **gpu_event,
                 )
 
-            # ==================== Tab 4: 系统 ====================
             with gr.TabItem("系统"):
-                gr.Markdown("""
-                ### 使用说明
-
-                1. **首次使用**：运行 `anime-gen-download` 下载基础模型
-                2. **配置**：编辑 `configs/default.yaml` 调整模型路径和优化选项
-                3. **ControlNet**：上传任意图片 + 选择控制模式 → 生成对应风格动漫图
-                   - **Pose**: 提取骨骼姿态 → 人物动作控制
-                   - **Lineart**: 提取线稿 → 线稿上色
-                   - **Canny**: 边缘检测 → 轮廓保持
-                   - **Depth**: 深度估计 → 空间结构保持
-                   - **SoftEdge**: 软边缘 → 柔和的结构引导
-                   - **Scribble**: 涂鸦 → 自由构图
-
-                ### 低配优化建议
-                - 4GB VRAM: 开启 `model_cpu_offload`
-                - 6GB VRAM: 开启 `attention_slicing` + `vae_tiling`
-                - 8GB+ VRAM: 可关闭部分优化以获得更好速度
-
-                ### 模型推荐
-                - 基础模型: Anything V5 / Counterfeit / AOM3
-                - LoRA: 在 CivitAI 下载对应角色/风格 LoRA
-                """)
-
-                unload_btn = gr.Button("卸载模型 (释放 VRAM)", variant="secondary")
+                gr.Markdown(
+                    "首次运行 `anime-gen-download` 下载基础模型；ControlNet 模型请按需下载。"
+                )
+                unload_button = gr.Button("卸载模型并释放内存")
                 unload_status = gr.Textbox(label="状态", interactive=False)
-                unload_btn.click(fn=on_unload, outputs=[unload_status, vram_display])
+                unload_button.click(
+                    fn=on_unload,
+                    outputs=[unload_status, vram_display],
+                    **gpu_event,
+                )
 
     return demo
 
 
 def main():
-    """WebUI 入口"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
     config = load_config()
-    wc = config.webui
-
+    if config.webui.share and not config.inference.enable_safety_checker:
+        logger.warning("WebUI 开启公网分享，但 safety checker 已关闭")
     demo = create_ui(config)
-    demo.queue(max_size=10)
+    demo.queue(max_size=10, default_concurrency_limit=1)
     demo.launch(
-        server_name=wc.host,
-        server_port=wc.port,
-        share=wc.share,
+        server_name=config.webui.host,
+        server_port=config.webui.port,
+        share=config.webui.share,
     )
 
 

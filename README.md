@@ -40,7 +40,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/anime-gen-pipeline.git
+git clone https://github.com/mengsxi/anime-gen-pipeline.git
 cd anime-gen-pipeline
 
 # 创建虚拟环境
@@ -50,24 +50,27 @@ venv\Scripts\activate
 # Linux/macOS:
 source venv/bin/activate
 
-# 安装
+# 完整功能安装（WebUI + ControlNet）
+pip install -e ".[all]"
+
+# 仅使用 Python API / CLI 时可安装核心依赖
 pip install -e .
 
-# 可选：安装 xformers / ToMe 加速组件
+# 可选：确认硬件和 PyTorch 版本兼容后安装 xformers / ToMe
 pip install -e ".[acceleration]"
 ```
 
 ### 下载模型
 
 ```bash
-# 一键下载全部模型 (基础模型 + ControlNet)
+# 默认仅下载基础模型（约 2.6 GiB）
 anime-gen-download
 
-# 仅下载基础模型
-anime-gen-download --base-only
-
-# 仅下载指定 ControlNet
+# 按需下载指定 ControlNet
 anime-gen-download --controlnet pose,lineart,canny
+
+# 下载基础模型和全部 ControlNet（通常超过 10 GiB）
+anime-gen-download --all-controlnet
 ```
 
 ### 启动 WebUI
@@ -137,11 +140,22 @@ anime-gen-pipeline/
 │   ├── webui.py              # Gradio WebUI
 │   ├── cli.py                # 命令行入口
 │   └── download.py           # 模型下载工具
+├── .github/workflows/ci.yml  # 多 Python 版本测试与 Diffusers 冒烟测试
 ├── pyproject.toml            # 项目元数据
 ├── requirements.txt          # 依赖清单
 ├── LICENSE                   # MIT 开源协议
 └── README.md
 ```
+
+## 开发与测试
+
+```bash
+pip install -e ".[dev]"
+ruff check src tests
+pytest -m "not integration"
+```
+
+GitHub Actions 会在 Python 3.10、3.11、3.12 上运行单元测试，并额外用一个微型模型验证真实的文生图、图生图和局部重绘链路。Dependabot 每周检查 Python 与 Actions 依赖更新。
 
 ## 低配优化策略
 
@@ -158,11 +172,11 @@ anime-gen-pipeline/
 
 ```yaml
 low_vram:
-  enable_attention_slicing: true
+  enable_attention_slicing: false  # PyTorch 2 默认使用 SDPA
   enable_vae_slicing: true
   enable_vae_tiling: true
   enable_model_cpu_offload: false   # 4GB显存时开启
-  enable_xformers: true
+  enable_xformers: false            # 仅特定旧显卡实测更快时开启
 ```
 
 ## ControlNet 模式速查
@@ -179,7 +193,7 @@ low_vram:
 ## 推荐模型
 
 ### 基础模型 (SD 1.5 动漫系)
-- [Anything V5](https://huggingface.co/andite/anything-v5.0) — 通用动漫 (默认)
+- [Anything V5](https://huggingface.co/Yntec/AnythingV5) — 通用动漫 (默认)
 - [Counterfeit V3.0](https://civitai.com/models/4468/counterfeit-v30) — 精致风格
 - [AOM3 (AbyssOrangeMix3)](https://huggingface.co/WarriorMama777/OrangeMixs) — 色彩丰富
 - [MeinaMix](https://civitai.com/models/7240/meinamix) — 东亚风格
@@ -197,7 +211,7 @@ A: 可以设置 HuggingFace 镜像:
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 ```
-或在 `download.py` 中取消注释镜像地址。
+Windows PowerShell 可使用 `$env:HF_ENDPOINT="https://hf-mirror.com"`。
 
 ### Q: 支持 SDXL 吗?
 A: 当前版本专注于 SD 1.5 (兼容性最好, VRAM 消耗最低)。SDXL 支持在 Roadmap 中。

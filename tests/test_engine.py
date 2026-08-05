@@ -11,9 +11,23 @@ class FakeTaskFactory:
 
     @classmethod
     def from_pipe(cls, pipe, **kwargs):
-        result = SimpleNamespace(source=pipe, kwargs=kwargs)
+        result = FakeTaskPipeline(source=pipe, kwargs=kwargs)
         cls.calls.append(result)
         return result
+
+
+class FakeTaskPipeline(SimpleNamespace):
+    model_offload_count = 0
+    sequential_offload_count = 0
+
+    def enable_model_cpu_offload(self):
+        self.model_offload_count += 1
+
+    def enable_sequential_cpu_offload(self):
+        self.sequential_offload_count += 1
+
+    def enable_xformers_memory_efficient_attention(self):
+        pass
 
 
 class FakeControlNet:
@@ -59,6 +73,16 @@ def test_task_pipelines_are_created_from_shared_base(monkeypatch, tmp_path: Path
     assert img_pipe.source is engine.pipe
     assert inpaint_pipe.source is engine.pipe
     assert engine.get_pipeline("img2img") is img_pipe
+
+
+def test_task_pipeline_reapplies_model_offload(monkeypatch, tmp_path: Path):
+    monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers_module())
+    engine = make_engine(tmp_path)
+    engine.config.low_vram.enable_model_cpu_offload = True
+
+    img_pipe = engine.get_pipeline("img2img")
+
+    assert img_pipe.model_offload_count == 1
 
 
 def test_controlnet_prefers_local_cache_and_keeps_one_mode(monkeypatch, tmp_path: Path):

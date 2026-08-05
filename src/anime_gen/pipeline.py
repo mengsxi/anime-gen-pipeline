@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from PIL import Image, PngImagePlugin
@@ -16,6 +17,7 @@ from .controlnet import ControlMode, ControlNetProcessor
 from .engine import ModelEngine
 
 logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[int, int], None]
 
 
 DEFAULT_NEGATIVE_PROMPT = (
@@ -39,6 +41,7 @@ class GenParams:
     cfg_scale: Optional[float] = None
     seed: Optional[int] = None
     batch_size: Optional[int] = None
+    clip_skip: Optional[int] = None
 
     init_image: Optional[Image.Image] = None
     strength: float = 0.75
@@ -75,38 +78,77 @@ class AnimePipeline:
         self.config = config or get_config()
         self.engine = ModelEngine(self.config)
         self.cn_processor: Optional[ControlNetProcessor] = None
+        self._lock = threading.RLock()
 
-    def txt2img(self, params: GenParams) -> GenResult:
-        return self._generate(params, mode="txt2img")
+    def txt2img(
+        self,
+        params: GenParams,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> GenResult:
+        return self._generate(
+            params, mode="txt2img", progress_callback=progress_callback
+        )
 
-    def img2img(self, params: GenParams) -> GenResult:
+    def img2img(
+        self,
+        params: GenParams,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> GenResult:
         if params.init_image is None:
             raise ValueError("img2img 需要提供 init_image")
-        return self._generate(params, mode="img2img")
+        return self._generate(
+            params, mode="img2img", progress_callback=progress_callback
+        )
 
-    def inpaint(self, params: GenParams) -> GenResult:
+    def inpaint(
+        self,
+        params: GenParams,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> GenResult:
         if params.init_image is None or params.mask_image is None:
             raise ValueError("inpaint 需要提供 init_image 和 mask_image")
-        return self._generate(params, mode="inpaint")
+        return self._generate(
+            params, mode="inpaint", progress_callback=progress_callback
+        )
 
     def generate_with_control(
         self,
         params: GenParams,
         control_image: Image.Image,
         control_mode: ControlMode | str = ControlMode.LINEART,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> GenResult:
-        if isinstance(control_mode, str):
-            control_mode = ControlMode(control_mode)
+        with self._lock:
+            if isinstance(control_mode, str):
+                control_mode = ControlMode(control_mode)
 
-        condition = self._get_cn_processor().process(control_image, control_mode)
-        resolved = replace(
-            params,
-            control_image=condition,
-            control_mode=control_mode,
-        )
-        return self._generate(resolved, mode="txt2img")
+            condition = self._get_cn_processor().process(control_image, control_mode)
+            resolved = replace(
+                params,
+                control_image=condition,
+                control_mode=control_mode,
+            )
+            return self._generate(
+                resolved,
+                mode="txt2img",
+                progress_callback=progress_callback,
+            )
 
-    def _generate(self, params: GenParams, mode: str) -> GenResult:
+    def _generate(
+        self,
+        params: GenParams,
+        mode: str,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> GenResult:
+        with self._lock:
+            return self._generate_locked(params, mode, progress_callback)
+
+    def _generate_locked(
+        self,
+        params: GenParams,
+        mode: str,
+        progress_callback: Optional[ProgressCallback],
+    ) -> GenResult:
         t0 = time.perf_counter()
         params = self._resolve_params(params)
         self._validate_params(params, mode)
@@ -147,6 +189,7 @@ class AnimePipeline:
                 mode,
                 generator,
                 lora_scale_via_kwargs=lora_scale_via_kwargs,
+                progress_callback=progress_callback,
             )
         finally:
             if lora_loaded:
@@ -170,7 +213,12 @@ class AnimePipeline:
             params=params,
             elapsed=elapsed,
             seed_used=seed,
-            metadata={"saved_paths": saved_paths},
+            metadata={
+                "saved_paths": saved_paths,
+                "model": self.config.models.base_model_id,
+                "scheduler": self.config.inference.scheduler,
+                "clip_skip": params.clip_skip,
+            },
         )
 
     @staticmethod
@@ -181,6 +229,7 @@ class AnimePipeline:
         generator: torch.Generator,
         *,
         lora_scale_via_kwargs: bool,
+        progress_callback: Optional[ProgressCallback],
     ) -> list[Image.Image]:
         common = {
             "prompt": params.prompt,
@@ -192,6 +241,15 @@ class AnimePipeline:
             "width": params.width,
             "height": params.height,
         }
+        if params.clip_skip is not None:
+            common["clip_skip"] = params.clip_skip
+        if progress_callback is not None:
+
+            def on_step_end(_pipe, step_index, _timestep, callback_kwargs):
+                progress_callback(step_index + 1, params.steps or 1)
+                return callback_kwargs
+
+            common["callback_on_step_end"] = on_step_end
         # 较早版本没有 set_adapters 时，退回 cross_attention_kwargs。
         if lora_scale_via_kwargs:
             common["cross_attention_kwargs"] = {"scale": params.lora_scale}
@@ -227,7 +285,9 @@ class AnimePipeline:
         return replace(
             params,
             width=params.width if params.width is not None else inference.default_width,
-            height=params.height if params.height is not None else inference.default_height,
+            height=(
+                params.height if params.height is not None else inference.default_height
+            ),
             steps=params.steps if params.steps is not None else inference.default_steps,
             cfg_scale=(
                 params.cfg_scale
@@ -240,7 +300,14 @@ class AnimePipeline:
                 if params.batch_size is not None
                 else inference.default_batch_size
             ),
-            output_dir=params.output_dir if params.output_dir is not None else output.dir,
+            clip_skip=(
+                params.clip_skip
+                if params.clip_skip is not None
+                else inference.clip_skip
+            ),
+            output_dir=(
+                params.output_dir if params.output_dir is not None else output.dir
+            ),
             save_metadata=(
                 params.save_metadata
                 if params.save_metadata is not None
@@ -265,6 +332,8 @@ class AnimePipeline:
             raise ValueError("batch_size 必须大于 0")
         if params.cfg_scale is None or params.cfg_scale < 0:
             raise ValueError("cfg_scale 不能为负数")
+        if params.clip_skip is not None and params.clip_skip < 1:
+            raise ValueError("clip_skip 必须大于等于 1 或设为 null")
         if not 0 <= params.strength <= 1:
             raise ValueError("strength 必须在 0 到 1 之间")
         if params.control_weight < 0:
@@ -300,7 +369,9 @@ class AnimePipeline:
             filepath = self._next_available_path(output_dir, stem, fmt)
             if params.save_metadata and fmt == "png":
                 metadata = PngImagePlugin.PngInfo()
-                metadata.add_text("parameters", self._build_metadata_string(params, seed))
+                metadata.add_text(
+                    "parameters", self._build_metadata_string(params, seed)
+                )
                 image.save(filepath, pnginfo=metadata)
             else:
                 image.save(filepath)
@@ -316,13 +387,14 @@ class AnimePipeline:
             counter += 1
         return candidate
 
-    @staticmethod
-    def _build_metadata_string(params: GenParams, seed: int) -> str:
+    def _build_metadata_string(self, params: GenParams, seed: int) -> str:
         lines = [
             params.prompt,
             f"Negative prompt: {params.negative_prompt}",
             f"Steps: {params.steps}, CFG scale: {params.cfg_scale}",
             f"Seed: {seed}, Size: {params.width}x{params.height}",
+            f"Model: {self.config.models.base_model_id}",
+            f"Scheduler: {self.config.inference.scheduler}",
         ]
         if params.control_mode:
             lines.append(
@@ -331,6 +403,8 @@ class AnimePipeline:
             )
         if params.lora_path:
             lines.append(f"LoRA: {params.lora_path}, scale: {params.lora_scale}")
+        if params.clip_skip is not None:
+            lines.append(f"Clip skip: {params.clip_skip}")
         return "\n".join(lines)
 
     def _get_cn_processor(self) -> ControlNetProcessor:
@@ -339,6 +413,7 @@ class AnimePipeline:
         return self.cn_processor
 
     def cleanup(self):
-        self.engine.unload_all()
-        if self.cn_processor is not None:
-            self.cn_processor._preprocessors.clear()
+        with self._lock:
+            self.engine.unload_all()
+            if self.cn_processor is not None:
+                self.cn_processor.cleanup()

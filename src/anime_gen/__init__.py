@@ -2,12 +2,12 @@
 Anime Gen Pipeline — 2D 动漫可控图像生成流水线
 """
 
-__version__ = "0.1.0"
-__author__ = "Your Name"
+__version__ = "0.2.0"
+__author__ = "mengsxi"
 
-from .pipeline import AnimePipeline, GenParams, GenResult
+from .controlnet import ControlMode, ControlNetProcessor
 from .engine import ModelEngine
-from .controlnet import ControlNetProcessor, ControlMode
+from .pipeline import AnimePipeline, GenParams, GenResult
 
 __all__ = [
     "AnimePipeline",

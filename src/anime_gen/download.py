@@ -1,22 +1,31 @@
 """
-模型下载工具 — 一键下载所需的基础模型和 ControlNet 模型
+模型下载工具 — 默认下载基础模型，ControlNet 按需选择。
 
 用法:
-    python -m anime_gen.download           # 下载全部
-    python -m anime_gen.download --base-only          # 仅基础模型
+    python -m anime_gen.download                    # 仅基础模型
+    python -m anime_gen.download --all-controlnet   # 基础模型 + 全部 ControlNet
     python -m anime_gen.download --controlnet pose,lineart  # 指定 ControlNet
 """
 
 import argparse
+import fnmatch
 import logging
 import os
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 
 from .config import AppConfig, load_config
 
 logger = logging.getLogger(__name__)
+COMMON_BASE_PATTERNS = [
+    "model_index.json",
+    "feature_extractor/*",
+    "scheduler/*",
+    "tokenizer/*",
+    "*/config.json",
+]
+CONTROLNET_PATTERNS = ["config.json", "diffusion_pytorch_model.*"]
 
 
 def _hub_kwargs() -> dict[str, str]:
@@ -26,7 +35,40 @@ def _hub_kwargs() -> dict[str, str]:
 
 
 def _model_dir_ready(path: Path, marker: str) -> bool:
-    return (path / marker).exists() and any(path.rglob("*.safetensors"))
+    weights_root = path / "unet" if marker == "model_index.json" else path
+    has_weights = any(weights_root.rglob("*.safetensors")) or any(
+        weights_root.rglob("*.bin")
+    )
+    return (path / marker).exists() and has_weights
+
+
+def _base_allow_patterns(config: AppConfig) -> list[str]:
+    variant = config.models.variant
+    weights = f"*/*.{variant}.safetensors" if variant else "*/*.safetensors"
+    return [*COMMON_BASE_PATTERNS, weights]
+
+
+def _estimate_download_size(repo_id: str, allow_patterns: list[str]) -> int | None:
+    try:
+        endpoint = os.environ.get("HF_ENDPOINT")
+        info = HfApi(endpoint=endpoint).model_info(repo_id, files_metadata=True)
+        return sum(
+            sibling.size or 0
+            for sibling in info.siblings
+            if any(
+                fnmatch.fnmatch(sibling.rfilename, pattern)
+                for pattern in allow_patterns
+            )
+        )
+    except Exception as exc:
+        logger.warning("无法预估 %s 下载体积: %s", repo_id, exc)
+        return None
+
+
+def _log_download_size(repo_id: str, allow_patterns: list[str]):
+    size = _estimate_download_size(repo_id, allow_patterns)
+    if size is not None:
+        logger.info("预计下载体积: %.2f GiB", size / 1024**3)
 
 
 def download_base_model(config: AppConfig):
@@ -40,11 +82,13 @@ def download_base_model(config: AppConfig):
 
     logger.info(f"下载基础模型: {model_id} → {local_path}")
     local_path.mkdir(parents=True, exist_ok=True)
+    allow_patterns = _base_allow_patterns(config)
+    _log_download_size(model_id, allow_patterns)
 
     snapshot_download(
         repo_id=model_id,
         local_dir=str(local_path),
-        ignore_patterns=["*.ckpt", "*.pt"],  # 只下 safetensors
+        allow_patterns=allow_patterns,
         **_hub_kwargs(),
     )
     logger.info(f"✓ 基础模型下载完成: {local_path}")
@@ -72,11 +116,12 @@ def download_controlnet_models(config: AppConfig, modes: list[str] | None = None
 
         logger.info(f"下载 ControlNet [{mode}]: {model_id}")
         local_path.mkdir(parents=True, exist_ok=True)
+        _log_download_size(model_id, CONTROLNET_PATTERNS)
 
         snapshot_download(
             repo_id=model_id,
             local_dir=str(local_path),
-            ignore_patterns=["*.ckpt", "*.pt"],
+            allow_patterns=CONTROLNET_PATTERNS,
             **_hub_kwargs(),
         )
         logger.info(f"✓ ControlNet [{mode}] 下载完成")
@@ -89,10 +134,20 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="下载 Anime Gen Pipeline 所需模型")
-    parser.add_argument("--base-only", action="store_true", help="仅下载基础模型")
-    parser.add_argument(
-        "--controlnet", type=str, default=None,
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--base-only", action="store_true", help="仅下载基础模型（默认）"
+    )
+    group.add_argument(
+        "--controlnet",
+        type=str,
+        default=None,
         help="指定 ControlNet 类型, 逗号分隔 (如: pose,lineart,canny)",
+    )
+    group.add_argument(
+        "--all-controlnet",
+        action="store_true",
+        help="下载全部已配置 ControlNet（通常超过 10 GiB）",
     )
     parser.add_argument("--config", type=str, default=None, help="配置文件路径")
     args = parser.parse_args()
@@ -103,15 +158,14 @@ def main():
     print("  Anime Gen Pipeline — 模型下载")
     print("=" * 60)
 
-    if args.base_only:
-        download_base_model(config)
-    elif args.controlnet:
+    if args.controlnet:
         modes = [m.strip() for m in args.controlnet.split(",")]
         download_controlnet_models(config, modes)
-    else:
-        # 全部下载
+    elif args.all_controlnet:
         download_base_model(config)
         download_controlnet_models(config)
+    else:
+        download_base_model(config)
 
     print("\n✓ 所有模型下载完成!")
     print(f"  基础模型: {config.models.base_model_path}")

@@ -61,6 +61,7 @@ class ModelEngine:
 
         logger.info("创建任务 Pipeline: %s", mode)
         task_pipe = factory.from_pipe(self.pipe)
+        self._reapply_offload(task_pipe)
         self._task_pipes[mode] = task_pipe
         return task_pipe
 
@@ -90,7 +91,9 @@ class ModelEngine:
         controlnet = ControlNetModel.from_pretrained(
             load_from,
             torch_dtype=self._dtype,
-            use_safetensors=True,
+            # 部分官方 SD1.5 ControlNet 仅提供 .bin，None 会优先
+            # safetensors 并在缺失时安全回退。
+            use_safetensors=None,
         )
 
         lv = self.config.low_vram
@@ -114,7 +117,11 @@ class ModelEngine:
         """获取当前 CUDA 设备的显存使用情况。"""
         if self._device.startswith("cuda") and torch.cuda.is_available():
             device = torch.device(self._device)
-            index = device.index if device.index is not None else torch.cuda.current_device()
+            index = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
             allocated = torch.cuda.memory_allocated(index) / 1024**3
             reserved = torch.cuda.memory_reserved(index) / 1024**3
             total = torch.cuda.get_device_properties(index).total_memory / 1024**3
@@ -152,10 +159,7 @@ class ModelEngine:
         )
 
         lv = self.config.low_vram
-        if lv.enable_model_cpu_offload:
-            control_pipe.enable_model_cpu_offload()
-        elif lv.enable_sequential_cpu_offload:
-            control_pipe.enable_sequential_cpu_offload()
+        self._reapply_offload(control_pipe)
 
         if lv.enable_xformers and self._device.startswith("cuda"):
             try:
@@ -184,7 +188,11 @@ class ModelEngine:
             if mps is None or not mps.is_available():
                 logger.warning("MPS 不可用，自动回退到 CPU")
                 return "cpu"
-        if requested != "cpu" and requested != "mps" and not requested.startswith("cuda"):
+        if (
+            requested != "cpu"
+            and requested != "mps"
+            and not requested.startswith("cuda")
+        ):
             raise ValueError(f"不支持的推理设备: {requested}")
         return requested
 
@@ -220,13 +228,18 @@ class ModelEngine:
         )
         logger.info("加载基础模型: %s", load_from)
 
-        pipe = StableDiffusionPipeline.from_pretrained(
-            load_from,
-            torch_dtype=self._dtype,
-            safety_checker=None,
-            requires_safety_checker=False,
-            use_safetensors=True,
-        )
+        load_kwargs = {
+            "torch_dtype": self._dtype,
+            "use_safetensors": self.config.models.use_safetensors,
+        }
+        if self.config.models.variant:
+            load_kwargs["variant"] = self.config.models.variant
+        if not self.config.inference.enable_safety_checker:
+            load_kwargs.update(
+                safety_checker=None,
+                requires_safety_checker=False,
+            )
+        pipe = StableDiffusionPipeline.from_pretrained(load_from, **load_kwargs)
 
         if self.config.models.vae_model_id:
             from diffusers import AutoencoderKL
@@ -235,8 +248,10 @@ class ModelEngine:
             pipe.vae = AutoencoderKL.from_pretrained(
                 self.config.models.vae_model_id,
                 torch_dtype=self._dtype,
+                use_safetensors=self.config.models.use_safetensors,
             )
 
+        self._configure_scheduler(pipe)
         self._apply_runtime_optimizations(pipe)
         self._pipe = pipe
         logger.info("模型加载完成 — %s", self.get_vram_info())
@@ -269,6 +284,42 @@ class ModelEngine:
         if lv.enable_tome:
             self._apply_tome(pipe, lv.tome_ratio)
 
+    def _reapply_offload(self, pipe):
+        """from_pipe 后重新安装与新执行顺序匹配的 offload hooks。"""
+        lv = self.config.low_vram
+        if lv.enable_model_cpu_offload:
+            pipe.enable_model_cpu_offload()
+        elif lv.enable_sequential_cpu_offload:
+            pipe.enable_sequential_cpu_offload()
+
+    def _configure_scheduler(self, pipe):
+        scheduler_name = self.config.inference.scheduler.lower()
+        if scheduler_name in {"model", "default"}:
+            return
+
+        from diffusers import (
+            DDIMScheduler,
+            DPMSolverMultistepScheduler,
+            EulerAncestralDiscreteScheduler,
+        )
+
+        scheduler_config = pipe.scheduler.config
+        if scheduler_name == "dpmpp_2m_karras":
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                scheduler_config,
+                algorithm_type="dpmsolver++",
+                use_karras_sigmas=True,
+            )
+        elif scheduler_name == "euler_a":
+            pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
+                scheduler_config
+            )
+        elif scheduler_name == "ddim":
+            pipe.scheduler = DDIMScheduler.from_config(scheduler_config)
+        else:
+            raise ValueError(f"不支持的 scheduler: {scheduler_name}")
+        logger.info("使用调度器: %s", scheduler_name)
+
     def _release_controlnet(self, empty_cache: bool = True):
         if self._controlnet_model is not None and self._device.startswith("cuda"):
             try:
@@ -298,4 +349,8 @@ class ModelEngine:
 
     @staticmethod
     def _model_dir_ready(path: Path, marker: str) -> bool:
-        return (path / marker).exists() and any(path.rglob("*.safetensors"))
+        weights_root = path / "unet" if marker == "model_index.json" else path
+        has_weights = any(weights_root.rglob("*.safetensors")) or any(
+            weights_root.rglob("*.bin")
+        )
+        return (path / marker).exists() and has_weights

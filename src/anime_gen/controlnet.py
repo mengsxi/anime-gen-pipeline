@@ -10,6 +10,8 @@ ControlNet 预处理与集成模块
   - softedge: 软边缘 (HED, 更柔和的边缘)
 """
 
+import gc
+import importlib
 import logging
 from enum import Enum
 from typing import Union
@@ -69,9 +71,7 @@ class ControlNetProcessor:
         result = method(img)
         return Image.fromarray(result) if isinstance(result, np.ndarray) else result
 
-    def process_pose(
-        self, image: Union[Image.Image, np.ndarray, str]
-    ) -> Image.Image:
+    def process_pose(self, image: Union[Image.Image, np.ndarray, str]) -> Image.Image:
         """提取 OpenPose 骨骼图"""
         return self.process(image, ControlMode.POSE)
 
@@ -88,16 +88,16 @@ class ControlNetProcessor:
         return self.process(image, ControlMode.SCRIBBLE)
 
     def process_canny(
-        self, image: Union[Image.Image, np.ndarray, str],
-        low: int = 100, high: int = 200,
+        self,
+        image: Union[Image.Image, np.ndarray, str],
+        low: int = 100,
+        high: int = 200,
     ) -> Image.Image:
         """Canny 边缘检测"""
         img = self._load_image(image)
         return self._preprocess_canny(img, low, high)
 
-    def process_depth(
-        self, image: Union[Image.Image, np.ndarray, str]
-    ) -> Image.Image:
+    def process_depth(self, image: Union[Image.Image, np.ndarray, str]) -> Image.Image:
         """深度估计"""
         return self.process(image, ControlMode.DEPTH)
 
@@ -115,34 +115,39 @@ class ControlNetProcessor:
         """OpenPose 骨骼提取"""
         proc = self._get_preprocessor("openpose")
         if proc is None:
-            from controlnet_aux import OpenposeDetector
+            OpenposeDetector = self._get_aux_class("OpenposeDetector")
             proc = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
-            self._preprocessors["openpose"] = proc
+            self._cache_preprocessor("openpose", proc)
         return proc(img)
 
     def _preprocess_lineart(self, img: Image.Image) -> Image.Image:
         """线稿提取 (使用 LineartDetector)"""
         proc = self._get_preprocessor("lineart")
         if proc is None:
-            from controlnet_aux import LineartDetector
+            LineartDetector = self._get_aux_class("LineartDetector")
             proc = LineartDetector.from_pretrained("lllyasviel/Annotators")
-            self._preprocessors["lineart"] = proc
+            self._cache_preprocessor("lineart", proc)
         return proc(img)
 
     def _preprocess_scribble(self, img: Image.Image) -> Image.Image:
         """涂鸦 (HED 软边缘 + 简化)"""
         proc = self._get_preprocessor("scribble")
         if proc is None:
-            from controlnet_aux import HEDdetector
+            HEDdetector = self._get_aux_class("HEDdetector")
             proc = HEDdetector.from_pretrained("lllyasviel/Annotators")
-            self._preprocessors["scribble"] = proc
+            self._cache_preprocessor("scribble", proc)
         return proc(img, scribble=True)
 
     def _preprocess_canny(
         self, img: Image.Image, low: int = 100, high: int = 200
     ) -> Image.Image:
         """Canny 边缘检测"""
-        import cv2
+        try:
+            import cv2
+        except ImportError as exc:
+            raise RuntimeError(
+                'Canny 依赖未安装，请运行: pip install -e ".[controlnet]"'
+            ) from exc
 
         arr = np.array(img)
         if len(arr.shape) == 3:
@@ -156,18 +161,18 @@ class ControlNetProcessor:
         """深度图估计"""
         proc = self._get_preprocessor("depth")
         if proc is None:
-            from controlnet_aux import MidasDetector
+            MidasDetector = self._get_aux_class("MidasDetector")
             proc = MidasDetector.from_pretrained("lllyasviel/Annotators")
-            self._preprocessors["depth"] = proc
+            self._cache_preprocessor("depth", proc)
         return proc(img)
 
     def _preprocess_softedge(self, img: Image.Image) -> Image.Image:
         """软边缘 (HED)"""
         proc = self._get_preprocessor("softedge")
         if proc is None:
-            from controlnet_aux import HEDdetector
+            HEDdetector = self._get_aux_class("HEDdetector")
             proc = HEDdetector.from_pretrained("lllyasviel/Annotators")
-            self._preprocessors["softedge"] = proc
+            self._cache_preprocessor("softedge", proc)
         return proc(img)
 
     # ----------------------------------------------------------------
@@ -176,6 +181,25 @@ class ControlNetProcessor:
 
     def _get_preprocessor(self, name: str):
         return self._preprocessors.get(name)
+
+    def _cache_preprocessor(self, name: str, processor):
+        """低配设备只保留最近使用的一个神经网络预处理器。"""
+        self._preprocessors.clear()
+        self._preprocessors[name] = processor
+
+    def cleanup(self):
+        self._preprocessors.clear()
+        gc.collect()
+
+    @staticmethod
+    def _get_aux_class(name: str):
+        try:
+            module = importlib.import_module("controlnet_aux")
+        except ImportError as exc:
+            raise RuntimeError(
+                'ControlNet 预处理依赖未安装，请运行: pip install -e ".[controlnet]"'
+            ) from exc
+        return getattr(module, name)
 
     @staticmethod
     def _load_image(image: Union[Image.Image, np.ndarray, str]) -> Image.Image:

@@ -8,7 +8,6 @@ from typing import Optional
 
 import yaml  # type: ignore
 
-
 DEFAULT_CONTROLNET_MODELS = {
     "pose": "lllyasviel/control_v11p_sd15_openpose",
     "lineart": "lllyasviel/control_v11p_sd15_lineart",
@@ -21,9 +20,11 @@ DEFAULT_CONTROLNET_MODELS = {
 
 @dataclass
 class ModelConfig:
-    base_model_id: str = "andite/anything-v5.0"
+    base_model_id: str = "Yntec/AnythingV5"
     base_model_path: str = "./models/base"
     vae_model_id: Optional[str] = None
+    use_safetensors: bool = True
+    variant: Optional[str] = "fp16"
     controlnet: dict[str, str | None] = field(
         default_factory=lambda: DEFAULT_CONTROLNET_MODELS.copy()
     )
@@ -41,16 +42,19 @@ class InferenceConfig:
     default_height: int = 768
     default_batch_size: int = 1
     default_seed: int = -1
+    clip_skip: Optional[int] = 2
+    scheduler: str = "dpmpp_2m_karras"
+    enable_safety_checker: bool = True
 
 
 @dataclass
 class LowVRAMConfig:
-    enable_attention_slicing: bool = True
+    enable_attention_slicing: bool = False
     enable_vae_slicing: bool = True
     enable_vae_tiling: bool = True
     enable_model_cpu_offload: bool = False
     enable_sequential_cpu_offload: bool = False
-    enable_xformers: bool = True
+    enable_xformers: bool = False
     enable_tome: bool = False
     tome_ratio: float = 0.5
 
@@ -125,9 +129,7 @@ def _dict_to_config(d: dict) -> AppConfig:
     low_vram_d = section("low_vram")
     output_d = section("output")
     webui_d = section("webui")
-    controlnet_d = models_d.get(
-        "controlnet", DEFAULT_CONTROLNET_MODELS.copy()
-    )
+    controlnet_d = models_d.get("controlnet", DEFAULT_CONTROLNET_MODELS.copy())
     if controlnet_d is None:
         controlnet_d = {}
     if not isinstance(controlnet_d, dict):
@@ -135,9 +137,11 @@ def _dict_to_config(d: dict) -> AppConfig:
 
     return AppConfig(
         models=ModelConfig(
-            base_model_id=models_d.get("base_model_id", "andite/anything-v5.0"),
+            base_model_id=models_d.get("base_model_id", "Yntec/AnythingV5"),
             base_model_path=models_d.get("base_model_path", "./models/base"),
             vae_model_id=models_d.get("vae_model_id"),
+            use_safetensors=models_d.get("use_safetensors", True),
+            variant=models_d.get("variant", "fp16"),
             controlnet=controlnet_d,
             controlnet_dir=models_d.get("controlnet_dir", "./models/controlnet"),
             lora_dir=models_d.get("lora_dir", "./models/lora"),

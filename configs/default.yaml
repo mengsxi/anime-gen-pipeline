@@ -4,9 +4,11 @@
 
 # --- 模型路径 ---
 models:
-  base_model_id: "andite/anything-v5.0"        # 动漫基础模型 (SD1.5生态)
+  base_model_id: "Yntec/AnythingV5"            # Diffusers 格式动漫基础模型
   base_model_path: "./models/base"             # 本地缓存路径
   vae_model_id: null                            # null=用内置VAE, 可设为 "stabilityai/sd-vae-ft-mse"
+  use_safetensors: true                         # 优先使用安全的 safetensors 权重
+  variant: "fp16"                              # 下载/加载半精度变体，减少磁盘占用
   
   controlnet:
     # 各 ControlNet 模型 (按需下载, 不用的设为 null)
@@ -30,15 +32,18 @@ inference:
   default_height: 768     # 动漫常用竖构图
   default_batch_size: 1
   default_seed: -1        # -1 = 随机
+  clip_skip: 2            # 动漫 SD1.5 常用设置；null 表示不跳层
+  scheduler: "dpmpp_2m_karras"  # model / dpmpp_2m_karras / euler_a / ddim
+  enable_safety_checker: true
 
 # --- 低配优化 (Low VRAM) ---
 low_vram:
-  enable_attention_slicing: true     # 切片注意力, 降低 ~30% VRAM
+  enable_attention_slicing: false    # PyTorch 2 默认 SDPA；仅兼容旧设备时开启
   enable_vae_slicing: true           # VAE 分块解码
   enable_vae_tiling: true            # VAE 分块编码/解码 (大图必须)
   enable_model_cpu_offload: false    # 逐模块 CPU offload (极低VRAM, 但慢)
   enable_sequential_cpu_offload: false  # 顺序 offload
-  enable_xformers: true              # xformers 高效注意力 (仅 CUDA)
+  enable_xformers: false             # PyTorch 2 通常无需 xformers
   enable_tome: false                 # Token Merging (加速, 质量略微下降)
   tome_ratio: 0.5                    # ToMe 合并比例
 

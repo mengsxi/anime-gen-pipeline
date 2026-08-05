@@ -6,7 +6,7 @@
 
 ### 报告 Bug
 
-1. 在 [Issues](https://github.com/yourusername/anime-gen-pipeline/issues) 中搜索是否已有相似问题
+1. 在 [Issues](https://github.com/mengsxi/anime-gen-pipeline/issues) 中搜索是否已有相似问题
 2. 如果没有, 新建 Issue, 包含:
    - 环境信息 (OS, Python 版本, VRAM, `pip list`)
    - 复现步骤

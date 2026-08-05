@@ -66,6 +66,9 @@ class FakeProcessor:
         self.calls.append((image, mode))
         return self.result
 
+    def cleanup(self):
+        self._preprocessors.clear()
+
 
 def make_pipeline(tmp_path: Path) -> tuple[AnimePipeline, FakeEngine]:
     config = AppConfig(
@@ -127,9 +130,7 @@ def test_lora_scale_is_applied_and_unloaded(tmp_path: Path):
     lora = tmp_path / "style.safetensors"
     lora.touch()
 
-    pipeline.txt2img(
-        GenParams(prompt="lora", lora_path=str(lora), lora_scale=0.35)
-    )
+    pipeline.txt2img(GenParams(prompt="lora", lora_path=str(lora), lora_scale=0.35))
 
     assert engine.pipeline.loaded_lora == (str(lora.parent), lora.name, "request")
     assert engine.pipeline.adapter == ("request", 0.35)
@@ -148,9 +149,26 @@ def test_config_defaults_and_existing_outputs_are_preserved(tmp_path: Path):
     assert call["num_inference_steps"] == 12
     assert call["guidance_scale"] == 6.5
     assert call["width"] == 512
+    assert first.metadata["model"] == pipeline.config.models.base_model_id
+    assert first.metadata["scheduler"] == pipeline.config.inference.scheduler
+    assert first.metadata["clip_skip"] == pipeline.config.inference.clip_skip
     assert first.metadata["saved_paths"] != second.metadata["saved_paths"]
     assert all(Path(path).exists() for path in first.metadata["saved_paths"])
     assert all(Path(path).exists() for path in second.metadata["saved_paths"])
+
+
+def test_progress_callback_receives_diffusion_steps(tmp_path: Path):
+    pipeline, engine = make_pipeline(tmp_path)
+    progress = []
+
+    pipeline.txt2img(
+        GenParams(prompt="progress", steps=3),
+        lambda current, total: progress.append((current, total)),
+    )
+
+    callback = engine.pipeline.calls[-1]["callback_on_step_end"]
+    callback(None, 1, None, {})
+    assert progress == [(2, 3)]
 
 
 @pytest.mark.parametrize(
