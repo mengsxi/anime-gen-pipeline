@@ -30,14 +30,14 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0.0,<3",
-    "diffusers>=0.27.0,<0.40",
-    "transformers>=4.36.0,<5",
+    "diffusers>=0.27.0,<0.41",
+    "transformers>=4.36.0,<6",
     "accelerate>=0.25.0,<2",
     "safetensors>=0.4.0,<1",
     "Pillow>=10.0.0,<13",
     "numpy>=1.24.0,<3",
     "pyyaml>=6.0,<7",
-    "huggingface_hub>=0.20.0,<2",
+    "huggingface_hub>=0.20.0,<3",
 ]
 
 [project.optional-dependencies]
@@ -55,12 +55,12 @@ webui = [
     "gradio>=4.0.0,<7",
 ]
 controlnet = [
-    "opencv-python-headless>=4.8.0,<5",
+    "opencv-python-headless>=4.8.0,<6",
     "controlnet_aux>=0.0.7,<1",
 ]
 all = [
     "gradio>=4.0.0,<7",
-    "opencv-python-headless>=4.8.0,<5",
+    "opencv-python-headless>=4.8.0,<6",
     "controlnet_aux>=0.0.7,<1",
 ]
 
